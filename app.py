@@ -76,7 +76,7 @@ class SlackChatBot:
         f_schema_name = ".".join(env_vars)
 
         self.cursor.execute(f"USE SCHEMA {f_schema_name}")
-        self.cursor.execute("SHOW CORTEX SEARCH SERVICES IN DATABASE")
+        self.cursor.execute("SHOW CORTEX SEARCH SERVICES IN SCHEMA")
         services = self.cursor.fetchall()
         service_metadata = []
         if services:
