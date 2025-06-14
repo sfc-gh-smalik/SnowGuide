@@ -1,5 +1,5 @@
 import requests
-from bs4 import BeautifulSoup, Comment
+from bs4 import BeautifulSoup, Comment, SoupStrainer
 import time
 import logging
 import hashlib
@@ -20,6 +20,13 @@ from queue import Queue, Empty
 import random
 import psutil
 import weakref
+from snowflake.snowpark import Session
+from snowflake.snowpark.types import *
+import pandas as pd
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 @dataclass
@@ -163,16 +170,32 @@ def detect_language_from_url_path(url: str) -> Optional[str]:
 class GracefulKiller:
     """Handle graceful shutdown without using signals."""
 
-    def __init__(self):
+    def __init__(self, timeout_hours: Optional[float] = None):
         self.kill_now = threading.Event()
+        self.start_time = time.time()
+        self.timeout_hours = timeout_hours
 
     def stop(self):
         """Stop the crawler gracefully."""
         self.kill_now.set()
 
+    # def should_stop(self) -> bool:
+    #     """Check if we should stop."""
+    #     return self.kill_now.is_set()
+
     def should_stop(self) -> bool:
-        """Check if we should stop."""
-        return self.kill_now.is_set()
+        """Check if we should stop due to manual intervention or timeout."""
+        if self.kill_now.is_set():
+            return True
+            
+        if self.timeout_hours:
+            elapsed_hours = (time.time() - self.start_time) / 3600
+            if elapsed_hours >= self.timeout_hours:
+                logging.info(f"Maximum runtime of {self.timeout_hours} hours reached. Stopping crawler.")
+                self.stop()
+                return True
+        
+        return False
 
 
 class DatabaseConnectionPool:
@@ -239,7 +262,7 @@ class SnowparkStorage:
         self.memory_monitor = MemoryMonitor()
 
         # Batch processing for optimization
-        self.batch_size = 200
+        self.batch_size = 100
         self.visited_urls_batch = []
         self.content_hashes_batch = []
         self.discovered_urls_batch = []
@@ -394,24 +417,74 @@ class SnowparkStorage:
         except Exception as e:
             logging.error(f"Error loading caches: {e}")
 
+    # def check_content_change(self, url: str, new_content_hash: str) -> Tuple[bool, str]:
+    #     """Check if content has changed using parameterized queries."""
+    #     with self.lock:
+    #         try:
+    #             # Use parameterized query to prevent SQL injection
+    #             changed_content = f"""
+    #                 SELECT CONTENT_HASH FROM {self.discovered_urls_table}
+    #                 WHERE URL = '{url}' """
+    #
+    #             result = self.session.sql(changed_content).collect()
+    #
+    #             if result:
+    #                 previous_hash = result[0]['CONTENT_HASH']
+    #                 return new_content_hash != previous_hash, previous_hash
+    #             return True, ""
+    #         except Exception as e:
+    #             print(f"Error checking content change: {e}")
+    #             sys.exit(0)
+    #             return True, ""
+
     def check_content_change(self, url: str, new_content_hash: str) -> Tuple[bool, str]:
-        """Check if content has changed using parameterized queries."""
+        """Check if content has changed and update revisit schedule."""
         with self.lock:
-            try:
-                # Use parameterized query to prevent SQL injection
-                changed_content = f"""
-                    SELECT CONTENT_HASH FROM {self.discovered_urls_table} 
-                    WHERE URL = '{url}' """
+            try:  # First check current content hash
+                check_content = f"""SELECT CONTENT_HASH 
+                                    FROM {self.discovered_urls_table} 
+                                    WHERE URL = '{url}' """
+                result = self.session.sql(check_content).collect()
+                previous_hash = result[0]['CONTENT_HASH'] if result else ""
+                content_changed = new_content_hash != previous_hash  # Update revisit schedule based on content change
 
-                result = self.session.sql(changed_content).collect()
+                if content_changed:  # Content changed - schedule next revisit sooner
+                    update_schedule = f"""MERGE INTO {self.revisit_schedule_table} AS target
+                                    USING (SELECT '{url}' AS URL) AS source
+                                    ON target.URL = source.URL
+                                    WHEN MATCHED THEN UPDATE SET
+                                        LAST_HASH = '{new_content_hash}',
+                                        LAST_REVISIT = CURRENT_TIMESTAMP(),
+                                        NEXT_REVISIT = DATEADD(hours, 24, CURRENT_TIMESTAMP()),
+                                        CONSECUTIVE_UNCHANGED = 0
+                                    WHEN NOT MATCHED THEN INSERT 
+                                        (URL, LAST_HASH, LAST_REVISIT, NEXT_REVISIT, REVISIT_INTERVAL_HOURS)
+                                    VALUES ('{url}', '{new_content_hash}', CURRENT_TIMESTAMP(), 
+                                         DATEADD(hours, 24, CURRENT_TIMESTAMP()), 24)"""
 
-                if result:
-                    previous_hash = result[0]['CONTENT_HASH']
-                    return new_content_hash != previous_hash, previous_hash
-                return True, ""
+                    self.session.sql(update_schedule).collect()
+
+                else:  # Content unchanged - increase revisit interval
+                    update_schedule = f"""MERGE INTO {self.revisit_schedule_table} AS target
+                                    USING (SELECT '{url}' AS URL) AS source
+                                    ON target.URL = source.URL
+                                    WHEN MATCHED THEN UPDATE SET
+                                        LAST_REVISIT = CURRENT_TIMESTAMP(),
+                                        NEXT_REVISIT = DATEADD(hours, 
+                                            LEAST(revisit_interval_hours * 2, 168), 
+                                            CURRENT_TIMESTAMP()),
+                                        CONSECUTIVE_UNCHANGED = CONSECUTIVE_UNCHANGED + 1,
+                                        REVISIT_INTERVAL_HOURS = LEAST(revisit_interval_hours * 2, 168)
+                                    WHEN NOT MATCHED THEN INSERT 
+                                        (URL, LAST_HASH, LAST_REVISIT, NEXT_REVISIT, REVISIT_INTERVAL_HOURS)
+                                    VALUES 
+                                        ('{url}', '{new_content_hash}', CURRENT_TIMESTAMP(), 
+                                         DATEADD(hours, 24, CURRENT_TIMESTAMP()), 24)
+                                """
+                self.session.sql(update_schedule).collect()
+                return content_changed, previous_hash
             except Exception as e:
-                print(f"Error checking content change: {e}")
-                sys.exit(0)
+                logging.error(f"Error checking content change: {e}")
                 return True, ""
 
     def check_duplicate_content(self, url: str, content_hash: str) -> Tuple[bool, Optional[str]]:
@@ -467,12 +540,12 @@ class SnowparkStorage:
     #             # Flush visited URLs
     #             if self.visited_urls_batch:
     #                 for url in self.visited_urls_batch:
-                        
+
     #                     merge_url = f"""MERGE INTO {self.visited_urls_table} AS target
     #                         USING (SELECT '{url}' AS URL) AS source
     #                         ON target.URL = source.URL
     #                         WHEN NOT MATCHED THEN INSERT (URL) VALUES (source.URL)"""
-                        
+
     #                     self.session.sql(merge_url).collect()
 
     #                 self.visited_cache.update(self.visited_urls_batch)
@@ -481,11 +554,11 @@ class SnowparkStorage:
     #             # Flush content hashes
     #             if self.content_hashes_batch:
     #                 for content_hash, url in self.content_hashes_batch:
-                        
+
     #                     merge_hashes = f"""MERGE INTO {self.content_hashes_table} AS target
     #                         USING (SELECT '{content_hash}' AS CONTENT_HASH, '{url}' AS FIRST_URL) AS source
     #                         ON target.CONTENT_HASH = source.CONTENT_HASH
-    #                         WHEN NOT MATCHED THEN INSERT (CONTENT_HASH, FIRST_URL) 
+    #                         WHEN NOT MATCHED THEN INSERT (CONTENT_HASH, FIRST_URL)
     #                         VALUES (source.CONTENT_HASH, source.FIRST_URL)
     #                     """
 
@@ -507,8 +580,6 @@ class SnowparkStorage:
     #         except Exception as e:
     #             print(f"Error flushing batches: {e}")
     #             sys.exit(0)
-
-
 
     def _flush_batches(self):
         """Optimized batch processing with bulk operations."""
@@ -549,7 +620,7 @@ class SnowparkStorage:
                         chunk = self.discovered_urls_batch[i:i + chunk_size]
                         for result in chunk:
                             self.insert_discovered_url_with_content(result)
-                    
+
                     self.url_cache.update([result.url for result in self.discovered_urls_batch])
                     self.discovered_urls_batch.clear()
 
@@ -559,14 +630,11 @@ class SnowparkStorage:
                 logging.error(f"Error flushing batches: {e}")
                 sys.exit(0)
 
-
-
     def insert_discovered_url_with_content(self, crawl_result: CrawlResult) -> bool:
         """Insert discovered URL with full content data."""
         # print('Inside insert_discovered_url_with_content')
         with self.lock:
             try:
-
 
                 cleaned_text = re.sub(r"'", r"''", crawl_result.cleaned_text)
                 headings = json.dumps(crawl_result.headings)
@@ -574,7 +642,6 @@ class SnowparkStorage:
                 images = {}
 
                 page_title = re.sub(r"'", r"''", crawl_result.page_title)
-
 
                 # Insert main record with content
                 merge_crawled_urls = f"""
@@ -630,13 +697,13 @@ class SnowparkStorage:
                         source.META_DESCRIPTION, source.META_KEYWORDS, source.HEADINGS, source.IMAGES, source.STRUCTURED_DATA
                     )
                 """
-    
+
                 self.session.sql(merge_crawled_urls).collect()
-    
+
                 # Store raw HTML separately if enabled and content is large
                 if crawl_result.raw_html and len(crawl_result.raw_html) > 1000:
                     content_table = f"{self.table_prefix}_PAGE_CONTENT"
-    
+
                     extracted_data = {}
                     extracted_data = {
                         'headings': crawl_result.headings,
@@ -645,9 +712,7 @@ class SnowparkStorage:
                         'structured_data': crawl_result.structured_data
                     }
 
-
                     extracted_data = json.dumps(extracted_data)
-                    
 
                     cleaned_text = crawl_result.cleaned_text
                     cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
@@ -670,17 +735,15 @@ class SnowparkStorage:
                         WHEN NOT MATCHED THEN INSERT (URL, RAW_HTML, CLEANED_TEXT, EXTRACTED_DATA)
                         VALUES (source.URL, source.RAW_HTML, source.CLEANED_TEXT, source.EXTRACTED_DATA)
                     """
-    
-    
+
                     self.session.sql(merge_content).collect()
-    
+
                 return True
-    
+
             except Exception as e:
                 print(f"Error inserting URL with content: {e}")
                 # return False  # Remove sys.exit(0) as it's not a good practice in a function
                 sys.exit(0)
-
 
     def url_exists(self, url: str) -> bool:
         """Check if URL exists with cache fallback."""
@@ -699,10 +762,6 @@ class SnowparkStorage:
 
                 if len(self.visited_urls_batch) >= self.batch_size:
                     self._flush_batches()
-
-    def content_hash_exists(self, content_hash: str) -> bool:
-        """Check if content hash exists with cache fallback."""
-        return content_hash in self.content_hash_cache
 
     def add_content_hash(self, content_hash: str, url: str):
         """Add content hash with batching."""
@@ -756,7 +815,6 @@ class SnowparkStorage:
                 print(f"Error saving crawler state: {e}")
                 # sys.exit(0)
 
-
     def load_crawler_state(self) -> Dict:
         """Load crawler state using safe queries."""
         with self.lock:
@@ -800,13 +858,12 @@ class SnowparkStorage:
                 ORDER BY d.DEPTH, d.CREATED_AT
                 LIMIT {limit} """
 
-
             result = self.session.sql(get_unvisisted_urls).collect()
 
             return [(row['URL'], row['FOUND_ON'], row['NEXT_DEPTH']) for row in result]
         except Exception as e:
             print(f"Error finding unvisited URLs: {e}")
-            sys.exit(0)
+            sys.exit(0) # hard stop
             return []
 
     def export_to_csv(self, filename: str):
@@ -923,6 +980,541 @@ class SnowparkStorage:
         self._flush_batches()
 
 
+class CSVStorage:
+    """CSV-based storage implementation with similar functionality to SnowparkStorage."""
+
+    def __init__(self, base_filename: str = "crawler", max_cache_size: int = 10000):
+        self.base_filename = base_filename
+        self.max_cache_size = max_cache_size
+        self.lock = threading.RLock()
+        self.memory_monitor = MemoryMonitor()
+
+        # File paths
+        self.discovered_urls_file = f"{base_filename}_discovered_urls.csv"
+        self.visited_urls_file = f"{base_filename}_visited_urls.csv"
+        self.content_hashes_file = f"{base_filename}_content_hashes.csv"
+        self.crawler_state_file = f"{base_filename}_state.json"
+        self.crawler_revisit_file = f"{self.base_filename}_revisit_tracking.csv"
+
+        # In-memory cache
+        self.visited_cache = set()
+        self.content_hash_cache = set()
+        self.url_cache = set()
+
+        # Batch processing
+        self.batch_size = 10
+        self.visited_urls_batch = []
+        self.content_hashes_batch = []
+        self.discovered_urls_batch = []
+
+        # Create files if they don't exist
+        self._create_files()
+        self._load_caches()
+
+    def _create_files(self):
+        """Create CSV files with headers if they don't exist."""
+        with self.lock:
+            # Discovered URLs file
+            if not os.path.exists(self.discovered_urls_file):
+                with open(self.discovered_urls_file, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['url', 'found_on', 'depth', 'timestamp', 'content_hash',
+                                     'page_title', 'status_code', 'language', 'last_visited',
+                                     'content_changed', 'previous_hash', 'visit_count',
+                                     'cleaned_text', 'content_size', 'content_type',
+                                     'meta_description', 'meta_keywords', 'headings',
+                                     'extracted_links', 'images', 'structured_data'])
+
+            # Visited URLs file
+            if not os.path.exists(self.visited_urls_file):
+                with open(self.visited_urls_file, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['url', 'visited_at'])
+
+            # Content hashes file
+            if not os.path.exists(self.content_hashes_file):
+                with open(self.content_hashes_file, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['content_hash', 'first_url', 'created_at'])
+
+    def _load_caches(self):
+        """Load existing data into memory caches."""
+        try:
+            # Load visited URLs
+            if os.path.exists(self.visited_urls_file):
+                with open(self.visited_urls_file, 'r', encoding='utf-8') as f:
+                    reader = csv.DictReader(f)
+                    self.visited_cache = {row['url'] for row in reader}
+
+            # Load content hashes
+            if os.path.exists(self.content_hashes_file):
+                with open(self.content_hashes_file, 'r', encoding='utf-8') as f:
+                    reader = csv.DictReader(f)
+                    self.content_hash_cache = {row['content_hash'] for row in reader}
+
+            # Load discovered URLs
+            if os.path.exists(self.discovered_urls_file):
+                with open(self.discovered_urls_file, 'r', encoding='utf-8') as f:
+                    reader = csv.DictReader(f)
+                    self.url_cache = {row['url'] for row in reader}
+
+        except Exception as e:
+            logging.error(f"Error loading caches: {e}")
+
+    def _flush_batches(self):
+        """Flush all pending batches to CSV files."""
+
+        # print("Flushing batches...")
+
+        import datetime 
+        
+        with self.lock:
+            try:
+                # Flush visited URLs
+                if self.visited_urls_batch:
+                    with open(self.visited_urls_file, 'a', newline='', encoding='utf-8') as f:
+                        writer = csv.writer(f)
+                        for url in self.visited_urls_batch:
+                            writer.writerow([url, datetime.datetime.now().isoformat()])
+                    self.visited_urls_batch.clear()
+
+                # Flush content hashes
+                if self.content_hashes_batch:
+                    with open(self.content_hashes_file, 'a', newline='', encoding='utf-8') as f:
+                        writer = csv.writer(f)
+                        for content_hash, url in self.content_hashes_batch:
+                            writer.writerow([content_hash, url, datetime.datetime.now().isoformat()])
+                    self.content_hashes_batch.clear()
+
+                # Flush discovered URLs
+                if self.discovered_urls_batch:
+                    with open(self.discovered_urls_file, 'a', newline='', encoding='utf-8') as f:
+                        writer = csv.writer(f)
+                        for result in self.discovered_urls_batch:
+                            writer.writerow([
+                                result.url, result.found_on, result.depth,
+                                result.timestamp, result.content_hash,
+                                result.page_title, result.status_code,
+                                result.language, result.last_visited,
+                                result.content_changed, result.previous_hash,
+                                result.visit_count, result.cleaned_text,
+                                result.content_size, result.content_type,
+                                result.meta_description, result.meta_keywords,
+                                json.dumps(result.headings),
+                                json.dumps(result.extracted_links),
+                                json.dumps(result.images),
+                                json.dumps(result.structured_data)
+                            ])
+                    self.discovered_urls_batch.clear()
+
+            except Exception as e:
+                print(f"Error flushing batches: {e}")
+
+    # def check_content_change(self, url: str, new_content_hash: str) -> Tuple[bool, str]:
+    #     """Check if content has changed."""
+    #     with self.lock:
+    #         try:
+    #             if os.path.exists(self.discovered_urls_file):
+    #                 with open(self.discovered_urls_file, 'r', encoding='utf-8') as f:
+    #                     reader = csv.DictReader(f)
+    #                     for row in reader:
+    #                         if row['url'] == url:
+    #                             return new_content_hash != row['content_hash'], row['content_hash']
+    #             return True, ""
+    #         except Exception as e:
+    #             logging.error(f"Error checking content change: {e}")
+    #             return True, ""
+
+    def check_content_change(self, url: str, new_content_hash: str) -> Tuple[bool, str]:
+        """Check if content has changed for CSV storage mode."""
+        # print('***************Sunny checking content*************')
+        with self.lock:
+            try:
+                if os.path.exists(self.discovered_urls_file):
+                    with open(self.discovered_urls_file, 'r', encoding='utf-8') as f:
+                        reader = csv.DictReader(f)
+                        for row in reader:
+                            if row['url'] == url:
+                                previous_hash = row.get('content_hash', '')
+                                content_changed = new_content_hash != previous_hash
+
+                                # Update revisit tracking in a separate file
+                                # print('***************Sunny Update revisit tracking*************')
+                                self._update_revisit_tracking(url, new_content_hash, content_changed)
+
+                                return content_changed, previous_hash
+
+                # URL not found, treat as new content
+                return True, ""
+
+            except Exception as e:
+                print(f"*************Error checking content change: {e}")
+                return True, ""
+
+    def _update_revisit_tracking(self, url: str, new_hash: str, content_changed: bool):
+        """Update revisit tracking information in CSV."""
+        import datetime
+        
+        revisit_file = self.crawler_revisit_file
+
+        # Create file if it doesn't exist
+        if not os.path.exists(revisit_file):
+            with open(revisit_file, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(['url', 'last_hash', 'last_revisit', 'next_revisit',
+                                 'revisit_interval_hours', 'consecutive_unchanged'])
+
+        current_time = datetime.datetime.now()
+        rows = []
+        found = False
+        # print('***************Sunny written data to revisit tracking*************')
+        # Read existing data
+        with open(revisit_file, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row['url'] == url:
+                    found = True
+                    # Update existing entry
+                    if content_changed:
+                        # Reset interval on change
+                        next_revisit = current_time + timedelta(hours=24)
+                        row.update({
+                            'last_hash': new_hash,
+                            'last_revisit': current_time.isoformat(),
+                            'next_revisit': next_revisit.isoformat(),
+                            'revisit_interval_hours': '24',
+                            'consecutive_unchanged': '0'
+                        })
+                    else:
+                        # Increase interval if unchanged
+                        consecutive = int(row.get('consecutive_unchanged', 0)) + 1
+                        interval = min(int(row.get('revisit_interval_hours', 24)) * 2, 168)
+                        next_revisit = current_time + timedelta(hours=interval)
+                        row.update({
+                            'last_revisit': current_time.isoformat(),
+                            'next_revisit': next_revisit.isoformat(),
+                            'revisit_interval_hours': str(interval),
+                            'consecutive_unchanged': str(consecutive)
+                        })
+                rows.append(row)
+
+        # Add new entry if URL not found
+        if not found:
+            next_revisit = current_time + timedelta(hours=24)
+            rows.append({
+                'url': url,
+                'last_hash': new_hash,
+                'last_revisit': current_time.isoformat(),
+                'next_revisit': next_revisit.isoformat(),
+                'revisit_interval_hours': '24',
+                'consecutive_unchanged': '0'
+            })
+
+        # Write updated data
+        with open(revisit_file, 'w', newline='', encoding='utf-8') as f:
+            if rows:
+                writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+                writer.writeheader()
+                writer.writerows(rows)
+
+    def check_duplicate_content(self, url: str, content_hash: str) -> Tuple[bool, Optional[str]]:
+        """Check if content is duplicate."""
+        with self.lock:
+            try:
+                if os.path.exists(self.content_hashes_file):
+                    with open(self.content_hashes_file, 'r', encoding='utf-8') as f:
+                        reader = csv.DictReader(f)
+                        for row in reader:
+                            if row['content_hash'] == content_hash:
+                                if row['first_url'] != url:
+                                    return True, row['first_url']
+                return False, None
+            except Exception as e:
+                logging.error(f"Error checking duplicate content: {e}")
+                return False, None
+
+    def mark_url_visited(self, url: str):
+        """Mark URL as visited with batching."""
+        with self.lock:
+            if url not in self.visited_cache:
+                self.visited_urls_batch.append(url)
+                self.visited_cache.add(url)
+                if len(self.visited_urls_batch) >= self.batch_size:
+                    self._flush_batches()
+
+    def add_content_hash(self, content_hash: str, url: str):
+        """Add content hash with batching."""
+        with self.lock:
+            if content_hash not in self.content_hash_cache:
+                self.content_hashes_batch.append((content_hash, url))
+                self.content_hash_cache.add(content_hash)
+                if len(self.content_hashes_batch) >= self.batch_size:
+                    self._flush_batches()
+
+    def insert_discovered_url_with_content(self, crawl_result: CrawlResult) -> bool:
+        """Insert discovered URL with full content data."""
+        with self.lock:
+            if crawl_result.url not in self.url_cache:
+                self.discovered_urls_batch.append(crawl_result)
+                self.url_cache.add(crawl_result.url)
+                if len(self.discovered_urls_batch) >= self.batch_size:
+                    # print('Sunny Calling from insert_discovered_url_with_content -_flush_batches ')
+                    self._flush_batches()
+                return True
+            return False
+
+    def url_exists(self, url: str) -> bool:
+        """Check if URL exists."""
+        return url in self.url_cache
+
+    def is_url_visited(self, url: str) -> bool:
+        """Check if URL has been visited."""
+        return url in self.visited_cache
+
+    def get_discovered_urls_count(self) -> int:
+        """Get count of discovered URLs."""
+        return len(self.url_cache)
+
+    def get_visited_urls_count(self) -> int:
+        """Get count of visited URLs."""
+        return len(self.visited_cache)
+
+    def save_crawler_state(self, state_data: Dict):
+        """Save crawler state to JSON file."""
+        with self.lock:
+            try:
+                with open(self.crawler_state_file, 'w', encoding='utf-8') as f:
+                    json.dump(state_data, f)
+            except Exception as e:
+                logging.error(f"Error saving crawler state: {e}")
+
+    def load_crawler_state(self) -> Dict:
+        """Load crawler state from JSON file."""
+        with self.lock:
+            try:
+                if os.path.exists(self.crawler_state_file):
+                    with open(self.crawler_state_file, 'r', encoding='utf-8') as f:
+                        return json.load(f)
+                return {}
+            except Exception as e:
+                logging.error(f"Error loading crawler state: {e}")
+                return {}
+
+    def get_statistics(self) -> Dict:
+        """Get crawling statistics."""
+        stats = {
+            'total_discovered': len(self.url_cache),
+            'total_visited': len(self.visited_cache),
+            'language_distribution': defaultdict(int),
+            'depth_distribution': defaultdict(int),
+            'status_code_distribution': defaultdict(int)
+        }
+
+        try:
+            with open(self.discovered_urls_file, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    stats['language_distribution'][row['language']] += 1
+                    stats['depth_distribution'][int(row['depth'])] += 1
+                    stats['status_code_distribution'][int(row['status_code'])] += 1
+        except Exception as e:
+            logging.error(f"Error getting statistics: {e}")
+
+        return stats
+
+    def close(self):
+        """Close and flush any pending operations."""
+        self._flush_batches()
+
+
+def upload_csv_to_snowflake(snowflake_config: dict, table_prefix: str) -> bool:
+    """
+    Upload CSV files to Snowflake tables using Snowpark DataFrame with merge operations.
+    """
+    try:
+        from snowflake.snowpark import Session
+        from snowflake.snowpark.types import StructType, StructField, StringType, IntegerType, TimestampType, \
+            BooleanType, VariantType
+        import pandas as pd
+        import os
+        from snowflake.snowpark.functions import col
+
+        # Create Snowpark session
+
+        try:
+            session = Session.builder.configs(snowflake_config).create()
+        except Exception as e:
+            try:
+                from snowflake.snowpark.context import get_active_session
+                session = get_active_session()
+            except Exception as e:
+                print('FATAL Error : Unable to connect to Snowflake Environment')
+                
+
+        # Define table names
+        discovered_urls_table = f"{table_prefix}_DISCOVERED_URLS"
+        visited_urls_table = f"{table_prefix}_VISITED_URLS"
+        content_hashes_table = f"{table_prefix}_CONTENT_HASHES"
+
+        # Define file paths
+        discovered_urls_file = f"{table_prefix}_discovered_urls.csv"
+        visited_urls_file = f"{table_prefix}_visited_urls.csv"
+        content_hashes_file = f"{table_prefix}_content_hashes.csv"
+
+        # Create tables if they don't exist
+        create_discovered_urls = f"""
+                CREATE TABLE IF NOT EXISTS {discovered_urls_table} (
+                    URL STRING PRIMARY KEY,
+                    FOUND_ON STRING,
+                    DEPTH NUMBER,
+                    TIMESTAMP STRING,
+                    CONTENT_HASH STRING,
+                    PAGE_TITLE STRING,
+                    STATUS_CODE NUMBER,
+                    LANGUAGE STRING,
+                    LAST_VISITED TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+                    CONTENT_CHANGED BOOLEAN DEFAULT FALSE,
+                    PREVIOUS_HASH STRING,
+                    VISIT_COUNT NUMBER DEFAULT 1,
+                    NEXT_REVISIT_TIME TIMESTAMP_NTZ,
+                    CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+                    UPDATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+                    CLEANED_TEXT VARCHAR,
+                    CONTENT_SIZE NUMBER,
+                    CONTENT_TYPE STRING,
+                    EXTRACTED_LINKS VARIANT,
+                    META_DESCRIPTION STRING,
+                    META_KEYWORDS STRING,
+                    HEADINGS VARIANT,
+                    IMAGES VARIANT,
+                    STRUCTURED_DATA VARIANT
+                )
+                """
+
+        create_visited_urls = f"""
+                CREATE TABLE IF NOT EXISTS {visited_urls_table} (
+                    URL STRING PRIMARY KEY,
+                    VISITED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+                )
+                """
+
+        create_content_hashes = f"""
+                CREATE TABLE IF NOT EXISTS {content_hashes_table} (
+                    CONTENT_HASH STRING PRIMARY KEY,
+                    FIRST_URL STRING,
+                    CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+                )
+                """
+
+        # Execute create table statements
+        session.sql(create_discovered_urls).collect()
+        session.sql(create_visited_urls).collect()
+        session.sql(create_content_hashes).collect()
+
+        # Upload discovered URLs
+        if os.path.exists(discovered_urls_file):
+            # Read CSV into pandas DataFrame
+            df = pd.read_csv(discovered_urls_file)
+            df.columns = df.columns.str.upper()
+
+            # Convert pandas DataFrame directly to Snowpark DataFrame
+            snow_df = session.create_dataframe(df)
+
+            # Create temp table for merge operation
+            temp_table = "TEMP_DISCOVERED_URLS"
+            snow_df.write.mode("overwrite").save_as_table(temp_table)
+
+            # Perform merge operation
+            merge_query = f"""
+            MERGE INTO {discovered_urls_table} target
+            USING {temp_table} source
+            ON target.URL = source.URL
+            WHEN MATCHED THEN UPDATE SET
+                CONTENT_HASH = source.CONTENT_HASH,
+                LAST_VISITED = CURRENT_TIMESTAMP(),
+                CONTENT_CHANGED = source.CONTENT_CHANGED,
+                VISIT_COUNT = target.VISIT_COUNT + 1,
+                CLEANED_TEXT = source.CLEANED_TEXT,
+                CONTENT_SIZE = source.CONTENT_SIZE,
+                META_DESCRIPTION = source.META_DESCRIPTION,
+                META_KEYWORDS = source.META_KEYWORDS,
+                HEADINGS = source.HEADINGS::VARIANT,
+                EXTRACTED_LINKS = source.EXTRACTED_LINKS::VARIANT,
+                IMAGES = source.IMAGES::VARIANT,
+                STRUCTURED_DATA = source.STRUCTURED_DATA::VARIANT,
+                UPDATED_AT = CURRENT_TIMESTAMP()
+            WHEN NOT MATCHED THEN INSERT (
+                URL, FOUND_ON, DEPTH, TIMESTAMP, CONTENT_HASH, PAGE_TITLE,
+                STATUS_CODE, LANGUAGE, LAST_VISITED, CONTENT_CHANGED,
+                PREVIOUS_HASH, VISIT_COUNT, CLEANED_TEXT, CONTENT_SIZE,
+                CONTENT_TYPE, META_DESCRIPTION, META_KEYWORDS, HEADINGS,
+                EXTRACTED_LINKS, IMAGES, STRUCTURED_DATA
+            ) VALUES (
+                source.URL, source.FOUND_ON, source.DEPTH, source.TIMESTAMP,
+                source.CONTENT_HASH, source.PAGE_TITLE, source.STATUS_CODE,
+                source.LANGUAGE, CURRENT_TIMESTAMP(), source.CONTENT_CHANGED,
+                source.PREVIOUS_HASH, source.VISIT_COUNT, source.CLEANED_TEXT,
+                source.CONTENT_SIZE, source.CONTENT_TYPE, source.META_DESCRIPTION,
+                source.META_KEYWORDS, source.HEADINGS::VARIANT, source.EXTRACTED_LINKS::VARIANT,
+                source.IMAGES::VARIANT, source.STRUCTURED_DATA::VARIANT
+            )
+            """
+            session.sql(merge_query).collect()
+            session.sql(f"DROP TABLE IF EXISTS {temp_table}").collect()
+            print(f"✓ Merged {len(df)} rows into {discovered_urls_table}")
+
+        # Upload visited URLs
+        if os.path.exists(visited_urls_file):
+            df = pd.read_csv(visited_urls_file)
+            df.columns = df.columns.str.upper()
+
+            snow_df = session.create_dataframe(df)
+
+            temp_table = "TEMP_VISITED_URLS"
+            snow_df.write.mode("overwrite").save_as_table(temp_table)
+
+            merge_query = f"""
+            MERGE INTO {visited_urls_table} target
+            USING {temp_table} source
+            ON target.URL = source.URL
+            WHEN NOT MATCHED THEN INSERT (URL, VISITED_AT)
+            VALUES (source.URL, CURRENT_TIMESTAMP())
+            """
+            session.sql(merge_query).collect()
+            session.sql(f"DROP TABLE IF EXISTS {temp_table}").collect()
+            print(f"✓ Merged {len(df)} rows into {visited_urls_table}")
+
+        # Upload content hashes
+        if os.path.exists(content_hashes_file):
+            df = pd.read_csv(content_hashes_file)
+            df.columns = df.columns.str.upper()
+
+            snow_df = session.create_dataframe(df)
+
+            temp_table = "TEMP_CONTENT_HASHES"
+            snow_df.write.mode("overwrite").save_as_table(temp_table)
+
+            merge_query = f"""
+            MERGE INTO {content_hashes_table} target
+            USING {temp_table} source
+            ON target.CONTENT_HASH = source.CONTENT_HASH
+            WHEN NOT MATCHED THEN INSERT (CONTENT_HASH, FIRST_URL, CREATED_AT)
+            VALUES (source.CONTENT_HASH, source.FIRST_URL, CURRENT_TIMESTAMP())
+            """
+            session.sql(merge_query).collect()
+            session.sql(f"DROP TABLE IF EXISTS {temp_table}").collect()
+            print(f"✓ Merged {len(df)} rows into {content_hashes_table}")
+
+        session.close()
+        return True
+
+    except Exception as e:
+        print(f"Error uploading CSV files to Snowflake: {str(e)}")
+        if 'session' in locals():
+            session.close()
+        return False
+
+
 class TelemetryManager:
     """Enhanced telemetry manager with health monitoring."""
 
@@ -971,7 +1563,7 @@ class TelemetryManager:
         telemetry_formatter = logging.Formatter('%(asctime)s - TELEMETRY - %(message)s')
         telemetry_handler.setFormatter(telemetry_formatter)
         self.telemetry_logger.addHandler(telemetry_handler)
-        self.telemetry_logger.setLevel(logging.INFO)
+        self.telemetry_logger.setLevel(logging.ERROR)
 
     def start_telemetry(self):
         """Start the telemetry reporting thread."""
@@ -1089,8 +1681,8 @@ class TelemetryManager:
         current_time = time.time()
 
         with self.telemetry_lock:
-            elapsed_time = current_time - self.start_time
-            time_since_last_report = current_time - self.last_report_time
+            elapsed_time = current_time - (self.start_time or current_time)
+            time_since_last_report = current_time - (self.last_report_time or current_time)
 
             # Calculate rates
             pages_per_second = self.pages_processed / elapsed_time if elapsed_time > 0 else 0
@@ -1134,6 +1726,8 @@ class TelemetryManager:
     def _format_progress_report(self, elapsed_time, pages_per_second, pages_per_second_recent,
                                 urls_per_second, mb_downloaded, mb_per_second, memory_usage):
         """Format enhanced progress report with health metrics."""
+        import datetime
+        
         hours, remainder = divmod(elapsed_time, 3600)
         minutes, seconds = divmod(remainder, 60)
 
@@ -1153,7 +1747,7 @@ class TelemetryManager:
         duplicate_rate = (self.duplicate_content_skipped / max(self.pages_processed, 1)) * 100
 
         report = f"""
-🕐 ENHANCED INCREMENTAL CRAWLER PROGRESS REPORT - {datetime.now().strftime('%H:%M:%S')}
+🕐 ENHANCED INCREMENTAL CRAWLER PROGRESS REPORT - {datetime.datetime.now().strftime('%H:%M:%S')}
 
 ⏱️  Runtime: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}
 📊 Pages Processed: {self.pages_processed:,} ({pages_per_second:.2f}/sec avg, {pages_per_second_recent:.2f}/sec recent)
@@ -1210,17 +1804,35 @@ class ThreadSafeCrawler:
         """Initialize the enhanced multi-threaded crawler with comprehensive improvements."""
         self.config = config
 
-        # Initialize graceful shutdown handler
-        self.killer = GracefulKiller()
+
+        # Initialize graceful shutdown handler with timeout
+        self.killer = GracefulKiller(timeout_hours=config.get('max_runtime_hours'))
+
 
         # Initialize URL validator
         self.url_validator = URLValidator()
 
-        # Database-only mode
-        table_prefix = config.get('table_prefix', 'CRAWLER')
-        max_cache_size = config.get('max_cache_size', 10000)
-        self.storage = SnowparkStorage(table_prefix, max_cache_size)
-        logging.info("Using Snowflake database storage with enhanced content capabilities")
+        # Initialize storage based on mode
+        self.use_database = config.get('use_database', False)
+        self.table_prefix = config.get('table_prefix', 'CRAWLER')
+
+        if self.use_database:
+            # Database-only mode
+            max_cache_size = config.get('max_cache_size', 10000)
+            self.storage = SnowparkStorage(self.table_prefix, max_cache_size)
+            logging.info("Using Snowflake database storage with enhanced content capabilities")
+
+        else:
+            # CSV Storage configuration
+            csv_config = {
+                # 'output_dir': config.get('output_dir', './crawler_data'),
+                # 'urls_file': config.get('urls_file', 'discovered_urls.csv'),
+                # 'state_file': config.get('state_file', 'crawler_state.json'),
+                # 'content_dir': config.get('content_dir', 'page_content'),
+                # 'compress_content': config.get('compress_content', False)
+            }
+            self.storage = CSVStorage(**csv_config)
+            print("Using CSV file storage with content capabilities")
 
         # Thread-safe data structures
         self.urls_to_visit: Queue = Queue()
@@ -1305,161 +1917,11 @@ class ThreadSafeCrawler:
             format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s',
             handlers=[
                 logging.FileHandler('crawler_debug.log'),
-                logging.StreamHandler()
+                # logging.StreamHandler()
             ]
         )
         self.logger = logging.getLogger(__name__)
 
-    
-    def _sanitize_content(self, content: str) -> str:
-        if not content:
-            return ""
-
-        try:
-            # content = content.replace('\\', '\\\\')
-            # content = content.replace('\x00', '')
-            # content = content.replace('\r\n', '\n')
-            # content = content.replace('\r', '\n')
-
-            content = content.replace("'", "''")
-            # content = content.replace('"', '""')
-
-            # content = content.replace('\x00', '')
-            # content = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', content)
-
-
-            # import unicodedata
-
-            # content = content.encode('utf-8', 'ignore').decode('utf-8')
-
-            # replacements = {
-            #                 '\u2028': ' ',
-            #                 '\u2029': ' ',
-            #                 '\u0085': ' ',
-            #                 '\u000B': ' ',
-            #                 '\u000C': ' ',
-            # }
-
-            # for old, new in replacements.items():
-            #     content = content.replace(old, new)
-
-
-            # content = re.sub(r'\s+', ' ', content).strip()
-
-            # content = content.replace('\r\n', '\n').replace('\r', '\n')
-
-            if len(content) > 50000:
-                content = content[:50000] + "...[truncated]"
-
-            return content
-
-        except Exception as e:
-            logging.error(f"Error sanitizing content:  {e}")
-            return ""
-
-
-    # def _process_webpage_content(self, html_content: str, url: str) -> Dict:
-    #     """Extract and process webpage content for storage."""
-    #     try:
-    #         soup = BeautifulSoup(html_content, 'html.parser')
-
-    #         # Extract meta information
-    #         meta_description = ""
-    #         meta_keywords = ""
-
-    #         if self.extract_metadata:
-    #             meta_desc = soup.find('meta', attrs={'name': 'description'})
-    #             if meta_desc and meta_desc.get('content'):
-    #                 meta_description = meta_desc.get('content')[:500]
-
-    #             meta_key = soup.find('meta', attrs={'name': 'keywords'})
-    #             if meta_key and meta_key.get('content'):
-    #                 meta_keywords = meta_key.get('content')[:500]
-
-    #         # Extract headings structure
-    #         headings = {}
-    #         if self.extract_headings:
-    #             for i in range(1, 7):
-    #                 heading_tags = soup.find_all(f'h{i}')
-    #                 if heading_tags:
-    #                     headings[f'h{i}'] = [tag.get_text().strip()[:200] for tag in heading_tags[:10]]
-
-    #         # Extract images with metadata
-    #         images = []
-    #         if self.extract_images:
-    #             img_tags = soup.find_all('img', src=True)
-    #             for img in img_tags[:20]:  # Limit to first 20 images
-    #                 img_data = {
-    #                     'src': urljoin(url, img.get('src', '')),
-    #                     'alt': img.get('alt', '')[:200],
-    #                     'title': img.get('title', '')[:200],
-    #                     'width': img.get('width', ''),
-    #                     'height': img.get('height', '')
-    #                 }
-    #                 images.append(img_data)
-
-    #         # Extract structured data (JSON-LD, microdata)
-    #         structured_data = {}
-    #         if self.extract_structured_data:
-    #             # JSON-LD extraction
-    #             json_ld_scripts = soup.find_all('script', type='application/ld+json')
-    #             if json_ld_scripts:
-    #                 json_ld_data = []
-    #                 for script in json_ld_scripts:
-    #                     try:
-    #                         data = json.loads(script.string)
-    #                         json_ld_data.append(data)
-    #                     except:
-    #                         pass
-    #                 if json_ld_data:
-    #                     structured_data['json_ld'] = json_ld_data
-
-    #         # Clean text content
-    #         cleaned_text = ""
-    #         if self.store_cleaned_text:
-    #             for tag in soup(['script', 'style', 'nav', 'header', 'footer', 'aside']):
-    #                 tag.decompose()
-
-    #             cleaned_text = soup.get_text()
-    #             cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
-    #             # Add sanitization
-    #             # cleaned_text = self._sanitize_content(cleaned_text)
-    #             cleaned_text = cleaned_text[:50000]  # Limit text size
-
-    #         # Extract all links
-    #         extracted_links = []
-    #         if self.extract_links:
-    #             for link in soup.find_all('a', href=True):
-    #                 href = link.get('href')
-    #                 if href:
-    #                     absolute_url = urljoin(url, href)
-    #                     if self._is_valid_https_url(absolute_url):
-    #                         extracted_links.append(absolute_url)
-    #             extracted_links = list(set(extracted_links))[:100]  # Limit and dedupe
-
-    #         return {
-    #             'cleaned_text': cleaned_text,
-    #             'meta_description': meta_description,
-    #             'meta_keywords': meta_keywords,
-    #             'headings': headings,
-    #             'images': images,
-    #             'extracted_links': extracted_links,
-    #             'structured_data': structured_data
-    #         }
-
-    #     except Exception as e:
-    #         self.logger.error(f"Error processing content for {url}: {e}")
-    #         return {
-    #             'cleaned_text': '',
-    #             'meta_description': '',
-    #             'meta_keywords': '',
-    #             'headings': {},
-    #             'images': [],
-    #             'extracted_links': [],
-    #             'structured_data': {}
-    #         }
-
-    
     def _process_webpage_content(self, html_content: str, url: str) -> Dict:
         """Optimized content processing with size checks."""
         # Early size check
@@ -1474,20 +1936,21 @@ class ThreadSafeCrawler:
                 'extracted_links': [],
                 'structured_data': {}
             }
-    
+
         try:
-            soup = BeautifulSoup(html_content, 'html.parser', parse_only=SoupStrainer(['meta', 'title', 'a', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']))
-            
+            soup = BeautifulSoup(html_content, 'html.parser',
+                                 parse_only=SoupStrainer(['meta', 'title', 'a', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']))
+
             # Process only essential content
             meta_description = ""
             meta_keywords = ""
             if self.extract_metadata:
                 meta_desc = soup.find('meta', attrs={'name': 'description'})
                 meta_description = meta_desc.get('content', '')[:500] if meta_desc else ""
-                
+
                 meta_key = soup.find('meta', attrs={'name': 'keywords'})
                 meta_keywords = meta_key.get('content', '')[:500] if meta_key else ""
-    
+
             # Extract headings more efficiently
             headings = {}
             if self.extract_headings:
@@ -1495,7 +1958,7 @@ class ThreadSafeCrawler:
                     heading_tags = soup.find_all(f'h{i}', limit=10)
                     if heading_tags:
                         headings[f'h{i}'] = [tag.get_text().strip()[:200] for tag in heading_tags]
-    
+
             # Optimize link extraction
             extracted_links = []
             if self.extract_links:
@@ -1507,10 +1970,10 @@ class ThreadSafeCrawler:
                         if self._is_valid_https_url(absolute_url):
                             extracted_links.append(absolute_url)
                             seen_urls.add(href)
-    
+
             # Simplified content cleaning
             cleaned_text = ' '.join(soup.stripped_strings)[:50000] if self.store_cleaned_text else ""
-    
+
             return {
                 'cleaned_text': cleaned_text,
                 'meta_description': meta_description,
@@ -1520,7 +1983,7 @@ class ThreadSafeCrawler:
                 'extracted_links': extracted_links,
                 'structured_data': {}  # Simplified structured data
             }
-    
+
         except Exception as e:
             logging.error(f"Error processing content for {url}: {e}")
             return {
@@ -1532,7 +1995,6 @@ class ThreadSafeCrawler:
                 'extracted_links': [],
                 'structured_data': {}
             }
-
 
     def _get_enhanced_content_hash(self, content: str) -> str:
         """Generate enhanced hash focusing on meaningful content only."""
@@ -1615,7 +2077,7 @@ class ThreadSafeCrawler:
             pending_urls = state.get('pending_urls', [])
 
             for url_data in pending_urls:
-                if (isinstance(url_data, (list, tuple)) and len(url_data) >= 3):
+                if isinstance(url_data, (list, tuple)) and len(url_data) >= 3:
                     url, found_on, depth = url_data[0], url_data[1], url_data[2]
                     if self.url_validator.is_valid_https_url(url) and not self.storage.is_url_visited(url):
                         self.urls_to_visit.put((url, found_on, depth, False))  # False = not revisit
@@ -1730,6 +2192,8 @@ class ThreadSafeCrawler:
 
     def _process_single_url(self, url_data: Tuple[str, str, int, bool]) -> List[Tuple[str, str, int]]:
         """Process a single URL with enhanced content extraction and storage."""
+        import datetime
+        
         if len(url_data) == 4:
             current_url, found_on, depth, is_revisit = url_data
         else:
@@ -1776,6 +2240,9 @@ class ThreadSafeCrawler:
             # Generate enhanced content hash
             content_hash = self._get_enhanced_content_hash(html_content)
 
+            # Add content hash to storage
+            self.storage.add_content_hash(content_hash, current_url)
+
             # Check for content changes and duplicates
             content_changed = True
             previous_hash = ""
@@ -1814,12 +2281,12 @@ class ThreadSafeCrawler:
                 url=current_url,
                 found_on=found_on,
                 depth=depth,
-                timestamp=datetime.now().isoformat(),
+                timestamp=datetime.datetime.now().isoformat(),
                 content_hash=content_hash,
                 page_title=page_title,
                 status_code=status_code,
                 language=detected_language,
-                last_visited=datetime.now().isoformat(),
+                last_visited=datetime.datetime.now().isoformat(),
                 content_changed=content_changed,
                 previous_hash=previous_hash,
                 raw_html=html_content[:100000] if self.store_raw_html else "",
@@ -1834,10 +2301,9 @@ class ThreadSafeCrawler:
                 structured_data=content_data['structured_data']
             )
 
-
             # Store the enhanced result
             if hasattr(self.storage, 'insert_discovered_url_with_content'):
-                # print('************insert_discovered_url_with_content**********')
+                # print('************Sunny insert_discovered_url_with_content**********')
                 self.storage.insert_discovered_url_with_content(result)
             else:
                 # Fallback to regular storage
@@ -1963,7 +2429,7 @@ class ThreadSafeCrawler:
                             self.logger.debug(f"Skipping non-HTML content: {url}")
                         return None
                 else:
-                    self.logger.warning(f"HTTP {response.status_code} for {url}")
+                    # self.logger.warning(f"HTTP {response.status_code} for {url}")
                     if response.status_code in [404, 403, 410, 429]:
                         return None
 
@@ -2177,6 +2643,8 @@ class ThreadSafeCrawler:
 
     def _save_state(self):
         """Save current crawler state."""
+        import datetime
+        
         try:
             # Collect pending URLs from queue
             pending_urls = []
@@ -2202,7 +2670,7 @@ class ThreadSafeCrawler:
                 'pages_processed': self.pages_processed,
                 'new_urls_found': self.new_urls_found,
                 'error_categories': dict(self.error_categories),
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.datetime.now().isoformat()
             }
 
             self.storage.save_crawler_state(state_data)
@@ -2236,9 +2704,9 @@ class ThreadSafeCrawler:
         self.logger.info("Press Ctrl+C to stop gracefully")
 
         # Test connection
-        if not test_snowflake_connection():
-            self.logger.error("Failed to connect to Snowflake. Aborting.")
-            return
+        # if not test_snowflake_connection():
+        #     self.logger.error("Failed to connect to Snowflake. Aborting.")
+        #     return
 
         self.start_time = time.time()
         self._last_save = self.start_time
@@ -2317,9 +2785,12 @@ class ThreadSafeCrawler:
             self._save_state()
 
             # Export to CSV if requested
+            print('********************Loading Tables in Snowflake*************')
             if self.export_csv:
-                csv_filename = self.config.get('csv_filename', 'discovered_urls.csv')
-                self.storage.export_to_csv(csv_filename)
+                # self.storage.export_to_csv(csv_filename)
+                upload_csv_to_snowflake({},
+                                        self.table_prefix
+                                        )
 
             # Close storage if needed
             if hasattr(self.storage, 'close'):
@@ -2400,16 +2871,21 @@ def main():
 
     # ===== ENHANCED CONFIGURATION SECTION =====
     # Modify these settings directly in the code
-
+    # private_key_path = get_private_key()
     # Snowflake Configuration (required for database mode)
-    SNOWFLAKE_CONFIG = {
-        'user': 'your_username',
-        'password': 'your_password',
-        'account': 'your_org-your_account',
-        'warehouse': 'your_warehouse',  # Optional
-        'database': 'your_database',
-        'schema': 'your_schema'
-    }
+    # SNOWFLAKE_CONFIG = {
+    #     'user': os.environ['SNOWFLAKE_USER'],
+    #     'host': os.environ['HOST'],
+    #     'port': '443',
+    #     'account': os.environ['SNOWFLAKE_ACCOUNT'],
+    #     'authenticator': 'externalbrowser',
+    #     'warehouse': os.environ['SNOWFLAKE_WAREHOUSE'],  # Optional
+    #     'database': os.environ['SNOWFLAKE_DATABASE'],
+    #     'schema': os.environ['SNOWFLAKE_SCHEMA'],
+    #     'session_parameters': {'ABORT_DETACHED_QUERY': 'TRUE'}
+    # }
+
+    SNOWFLAKE_CONFIG = {}
 
     # Crawling Targets
     STARTING_URLS = [
@@ -2427,16 +2903,16 @@ def main():
 
     # Crawling Parameters
     MAX_DEPTH = 12
-    MAX_WORKERS = 8
+    MAX_WORKERS = 40
     REQUEST_DELAY = 1  # seconds between requests
 
     # Enhanced Content Storage Configuration
     STORE_RAW_HTML = False  # Store full HTML content
-    STORE_CLEANED_TEXT = True  # Store cleaned text content
-    STORE_EXTRACTED_DATA = True  # Store structured data
+    STORE_CLEANED_TEXT = False  # Store cleaned text content
+    STORE_EXTRACTED_DATA = False  # Store structured data
     MAX_CONTENT_SIZE = 5000000  # 5MB limit per page
-    EXTRACT_METADATA = True  # Extract meta tags
-    EXTRACT_HEADINGS = True  # Extract heading structure
+    EXTRACT_METADATA = False  # Extract meta tags
+    EXTRACT_HEADINGS = False  # Extract heading structure
     EXTRACT_IMAGES = False  # Extract image information
     EXTRACT_LINKS = True  # Extract all links
     EXTRACT_STRUCTURED_DATA = False  # Extract JSON-LD and microdata
@@ -2447,11 +2923,16 @@ def main():
     ENABLE_LANGUAGE_FILTERING = True
     ENABLE_URL_LANGUAGE_FILTERING = True
 
+    # Max runtime as failsafe (Can be configured for one-time vs incremental)
+    MAX_RUNTIME_HOURS = 4
+
     # File Configuration
     TABLE_PREFIX = 'CRAWLER'
 
     # Debug Mode
     DEBUG_MODE = False
+
+    USE_DATABASE = False
 
     # ===== END CONFIGURATION SECTION =====
 
@@ -2461,6 +2942,16 @@ def main():
         'snowflake_config': SNOWFLAKE_CONFIG,
         'table_prefix': TABLE_PREFIX,
         'max_cache_size': 10000,
+
+        # Storage configuration
+        'use_database': USE_DATABASE,  # Set to False for CSV storage
+
+        # CSV Storage configuration (only used if use_database=False)
+        'output_dir': './crawler_data',
+        'urls_file': 'discovered_urls.csv',
+        'state_file': 'crawler_state.json',
+        'content_dir': 'page_content',
+        'compress_content': False,
 
         # Crawling targets
         'starting_urls': STARTING_URLS,
@@ -2473,6 +2964,9 @@ def main():
         'timeout': 15,
         'max_retries': 3,
         'queue_timeout': 10,
+
+        # Time-based kill switch
+        'max_runtime_hours': MAX_RUNTIME_HOURS,
 
         # Enhanced content storage options
         'store_raw_html': STORE_RAW_HTML,
@@ -2497,13 +2991,13 @@ def main():
         'enable_url_language_filtering': ENABLE_URL_LANGUAGE_FILTERING,
 
         # Performance and monitoring
-        'save_interval': 200,
+        'save_interval': 100,
         'telemetry_interval': 360,
         'diminishing_returns_threshold': 10,
         'diminishing_returns_pages': 50,
 
         # Output options
-        'export_csv': False,
+        'export_csv': True,
         'debug_mode': DEBUG_MODE,
     }
 
@@ -2525,8 +3019,8 @@ def main():
     if config['store_raw_html'] and config['max_content_size'] < 10000:
         validation_errors.append("max_content_size too small for raw HTML storage")
 
-    if not config['snowflake_config']:
-        validation_errors.append("Snowflake configuration required for database mode")
+    # if not config['snowflake_config']:
+    #     validation_errors.append("Snowflake configuration required for database mode")
 
     if validation_errors:
         print("\n❌ Configuration Validation Errors:")
@@ -2614,6 +3108,10 @@ def main():
                     crawler.storage.close()
             except Exception as e:
                 logging.error(f"Error during cleanup: {e}")
+
+            if config.get('export_csv'):
+                # self.storage.export_to_csv(csv_filename)
+                upload_csv_to_snowflake({},'crawler')
 
         print("\n✅ Enhanced crawler session completed.")
         print("📊 Check your Snowflake database for enhanced content results.")
