@@ -87,12 +87,21 @@ post_process_missing_content(batch_size=100, max_retries=3)
 
 
 ## Data Storage
-The crawler creates the following tables in Snowflake: - `{prefix}_DISCOVERED_URLS`: Main table for crawled URLs
-and content - `{prefix}_VISITED_URLS`: Track visited URLs - `{prefix}_CONTENT_HASHES`: Track content changes - `{prefix}_STATE`: Store crawler state - `{prefix}_REVISIT_SCHEDULE`: Manage incremental crawling ## Requirements
-- Python 3.9 + - Snowflake account with appropriate permissions - Required Python packages: - requests - beautifulsoup4 - langdetect - snowflake - snowpark - python ##
+The crawler creates the following tables in Snowflake: 
+
+- `{prefix}_DISCOVERED_URLS`: Main table for crawled URLs and content
+- `{prefix}_VISITED_URLS`: Track visited URLs
+- `{prefix}_CONTENT_HASHES`: Track content changes
+- `{prefix}_STATE`: Store crawler state
+- `{prefix}_REVISIT_SCHEDULE`: Manage incremental crawling
+
+- ## Requirements
+- Python 3.9 + - Snowflake account with appropriate permissions
+- Required Python packages:
+- requests - beautifulsoup4 - langdetect - snowflake - snowpark - python ##
 
 
-Best Practices
+## Best Practices
 1.Start with a small set of URLs for testing
 2.Monitor memory usage and adjust worker count accordingly
 3.Use appropriate delays to avoid overwhelming target servers
