@@ -989,6 +989,8 @@ class CSVStorage:
         self.lock = threading.RLock()
         self.memory_monitor = MemoryMonitor()
 
+        self.table_prefix = base_filename
+
         # File paths
         self.discovered_urls_file = f"{base_filename}_discovered_urls.csv"
         self.visited_urls_file = f"{base_filename}_visited_urls.csv"
@@ -1006,6 +1008,19 @@ class CSVStorage:
         self.visited_urls_batch = []
         self.content_hashes_batch = []
         self.discovered_urls_batch = []
+
+
+        # Check if files exist, if not try to generate from Snowflake
+        files_exist = all(os.path.exists(f) for f in [
+	        self.discovered_urls_file,
+	        self.visited_urls_file,
+	        self.content_hashes_file
+	    ])
+        
+        if not files_exist:
+            logging.info("Local CSV files not found. Attempting to generate from Snowflake...")
+            self._generate_files_from_snowflake()
+
 
         # Create files if they don't exist
         self._create_files()
@@ -1060,6 +1075,45 @@ class CSVStorage:
 
         except Exception as e:
             logging.error(f"Error loading caches: {e}")
+
+
+    def _generate_files_from_snowflake(self):
+        """Generate local CSV files from existing Snowflake tables."""
+        try:
+            from snowflake.snowpark.context import get_active_session
+            session = get_active_session()
+            
+            # Check if Snowflake tables exist and create corresponding CSV files
+            tables_to_check = [
+                (f"{self.table_prefix}_DISCOVERED_URLS", self.discovered_urls_file),
+                (f"{self.table_prefix}_VISITED_URLS", self.visited_urls_file),
+                (f"{self.table_prefix}_CONTENT_HASHES", self.content_hashes_file)
+            ]
+            
+            for table_name, csv_file in tables_to_check:
+                try:
+                    # Check if table exists
+                    check_table = f"SHOW TABLES LIKE '{table_name}'"
+                    result = session.sql(check_table).collect()
+                    
+                    if result:
+                        # Export table data to CSV
+                        query = f"SELECT * FROM {table_name}"
+                        df = session.sql(query).to_pandas()
+                        
+                        # Write to CSV file
+                        df.to_csv(csv_file, index=False)
+                        # logging.info(f"Generated {csv_file} from {table_name}")
+                        print(f"Generated {csv_file} from {table_name}")
+                        
+                except Exception as e:
+                    logging.warning(f"Could not generate {csv_file} from {table_name}: {e}")
+                    continue
+                  
+        except Exception as e:
+            logging.warning(f"Could not connect to Snowflake to generate local files: {e}")
+
+
 
     def _flush_batches(self):
         """Flush all pending batches to CSV files."""
