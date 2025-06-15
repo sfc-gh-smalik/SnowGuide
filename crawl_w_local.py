@@ -1113,8 +1113,7 @@ class CSVStorage:
         except Exception as e:
             logging.warning(f"Could not connect to Snowflake to generate local files: {e}")
 
-
-
+    
     def _flush_batches(self):
         """Flush all pending batches to CSV files."""
 
@@ -1966,6 +1965,12 @@ class ThreadSafeCrawler:
 
     def _setup_logging(self, log_level):
         """Setup thread-safe logging configuration."""
+        # Clear any existing handlers
+        root = logging.getLogger()
+        if root.handlers:
+            for handler in root.handlers:
+                root.removeHandler(handler)
+            
         logging.basicConfig(
             level=log_level,
             format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s',
@@ -2244,6 +2249,54 @@ class ThreadSafeCrawler:
             self.logger.debug(f"Error normalizing URL {url}: {e}")
             return None
 
+
+    def _normalize_url_with_language(self, url: str) -> str:
+        """
+        Normalize URL by handling language path segments and .html extensions.
+        Examples:
+        - https://docs.snowflake.com/en/user-guide -> https://docs.snowflake.com/user-guide
+        - https://docs.snowflake.com/en/user-guide.html -> https://docs.snowflake.com/user-guide
+        - https://docs.snowflake.com/user-guide.html -> https://docs.snowflake.com/user-guide
+        """
+        if not url:
+            return url
+        
+        try:
+            parsed = urlparse(url)
+            path_parts = parsed.path.strip('/').split('/')
+            
+            # Common language codes in URLs
+            language_codes = {'en', 'fr', 'de', 'es', 'it', 'ja', 'ko', 'pt', 'zh', 'ru'}
+            
+            # If first path segment is a language code, remove it
+            if path_parts and path_parts[0].lower() in language_codes:
+                path_parts = path_parts[1:]
+            
+            # Remove .html extension from the last path segment
+            if path_parts and path_parts[-1].lower().endswith('.html'):
+                path_parts[-1] = path_parts[-1][:-5]  # Remove .html
+                
+            # Reconstruct URL without language code and .html
+            new_path = '/' + '/'.join(path_parts)
+            if new_path == '/':
+                new_path = ''
+                
+            normalized = urlunparse((
+                parsed.scheme.lower(),
+                parsed.netloc.lower(),
+                new_path,
+                parsed.params,
+                parsed.query,
+                ''  # Remove fragments
+            ))
+            
+            return normalized
+            
+        except Exception as e:
+            logging.error(f"Error normalizing URL {url}: {e}")
+            return url
+
+    
     def _process_single_url(self, url_data: Tuple[str, str, int, bool]) -> List[Tuple[str, str, int]]:
         """Process a single URL with enhanced content extraction and storage."""
         import datetime
@@ -2263,6 +2316,13 @@ class ThreadSafeCrawler:
 
             # Check depth limit
             if depth > self.max_depth:
+                return new_urls
+
+            # Normalize the current URL
+            normalized_url = self._normalize_url_with_language(current_url)
+
+            # Check if normalized URL exists before processing
+            if self.storage.url_exists(normalized_url):
                 return new_urls
 
             # For revisits, skip the "already visited" check
@@ -2374,9 +2434,15 @@ class ThreadSafeCrawler:
             found_urls = self._extract_urls_from_page(html_content, current_url)
 
             for url in found_urls:
-                # For revisits, add all URLs regardless of visit status
-                if is_revisit or not self.storage.is_url_visited(url):
-                    new_urls.append((url, current_url, depth + 1, False))
+
+                normalized_found_url = self._normalize_url_with_language(url)
+                # Only add if normalized URL hasn't been seen
+                if not self.storage.is_url_visited(normalized_found_url):
+                    new_urls.append((normalized_found_url, current_url, depth + 1, False))
+                
+                # # For revisits, add all URLs regardless of visit status
+                # if is_revisit or not self.storage.is_url_visited(url):
+                #     new_urls.append((url, current_url, depth + 1, False))
 
             self.telemetry.update_urls_discovered(len(new_urls))
 
