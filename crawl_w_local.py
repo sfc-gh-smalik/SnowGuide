@@ -1135,10 +1135,7 @@ class CSVStorage:
 
     
     def _flush_batches(self):
-        """Flush all pending batches to CSV files."""
-
-        # print("Flushing batches...")
-
+        """Flush all pending batches to CSV files with complete column set."""
         import datetime 
         
         with self.lock:
@@ -1147,41 +1144,60 @@ class CSVStorage:
                 if self.visited_urls_batch:
                     with open(self.visited_urls_file, 'a', newline='', encoding='utf-8') as f:
                         writer = csv.writer(f)
+                        current_time = datetime.datetime.now().isoformat()
                         for url in self.visited_urls_batch:
-                            writer.writerow([url, datetime.datetime.now().isoformat()])
+                            writer.writerow([url, current_time])
                     self.visited_urls_batch.clear()
-
+    
                 # Flush content hashes
                 if self.content_hashes_batch:
                     with open(self.content_hashes_file, 'a', newline='', encoding='utf-8') as f:
                         writer = csv.writer(f)
+                        current_time = datetime.datetime.now().isoformat()
                         for content_hash, url in self.content_hashes_batch:
-                            writer.writerow([content_hash, url, datetime.datetime.now().isoformat()])
+                            writer.writerow([content_hash, url, current_time])
                     self.content_hashes_batch.clear()
-
-                # Flush discovered URLs
+    
+                # Flush discovered URLs with all columns matching Snowflake schema
                 if self.discovered_urls_batch:
                     with open(self.discovered_urls_file, 'a', newline='', encoding='utf-8') as f:
                         writer = csv.writer(f)
+                        current_time = datetime.datetime.now().isoformat()
+                        next_revisit_time = (datetime.datetime.now() + datetime.timedelta(hours=24)).isoformat()
+
                         for result in self.discovered_urls_batch:
+                            # Create a row with all columns matching Snowflake schema
                             writer.writerow([
-                                result.url, result.found_on, result.depth,
-                                result.timestamp, result.content_hash,
-                                result.page_title, result.status_code,
-                                result.language, result.last_visited,
-                                result.content_changed, result.previous_hash,
-                                result.visit_count, result.cleaned_text,
-                                result.content_size, result.content_type,
-                                result.meta_description, result.meta_keywords,
-                                json.dumps(result.headings),
-                                json.dumps(result.extracted_links),
-                                json.dumps(result.images),
-                                json.dumps(result.structured_data)
+                                result.url,                      # URL
+                                result.found_on,                 # FOUND_ON
+                                result.depth,                    # DEPTH
+                                result.timestamp,                # TIMESTAMP
+                                result.content_hash,             # CONTENT_HASH
+                                result.page_title,               # PAGE_TITLE
+                                result.status_code,              # STATUS_CODE
+                                result.language,                 # LANGUAGE
+                                current_time,                    # LAST_VISITED
+                                result.content_changed,          # CONTENT_CHANGED
+                                result.previous_hash,            # PREVIOUS_HASH
+                                result.visit_count,              # VISIT_COUNT
+                                next_revisit_time,               # NEXT_REVISIT_TIME
+                                current_time,                    # CREATED_AT
+                                current_time,                    # UPDATED_AT
+                                result.cleaned_text,             # CLEANED_TEXT
+                                result.content_size or 0,        # CONTENT_SIZE
+                                result.content_type,             # CONTENT_TYPE
+                                result.meta_description,         # META_DESCRIPTION
+                                result.meta_keywords,            # META_KEYWORDS
+                                json.dumps(result.headings),     # HEADINGS
+                                json.dumps(result.extracted_links), # EXTRACTED_LINKS
+                                json.dumps(result.images),       # IMAGES
+                                json.dumps(result.structured_data) # STRUCTURED_DATA
                             ])
                     self.discovered_urls_batch.clear()
-
+    
             except Exception as e:
                 print(f"Error flushing batches: {e}")
+
 
     def check_content_change(self, url: str, new_content_hash: str) -> Tuple[bool, str]:
         """Check if content has changed for CSV storage mode."""
@@ -1190,17 +1206,11 @@ class CSVStorage:
                 if os.path.exists(self.discovered_urls_file):
                     with open(self.discovered_urls_file, 'r', encoding='utf-8') as f:
                         reader = csv.DictReader(f)
-                        # Convert column names to lowercase for case-insensitive matching
-                        fieldnames = {name.lower(): name for name in reader.fieldnames}
-                        
+
                         for row in reader:
-                            if row[fieldnames['url']].strip() == url:
-                                previous_hash = row[fieldnames['content_hash']].strip()
+                            if row['url'].strip() == url:
+                                previous_hash = row['content_hash'].strip()
                                 content_changed = new_content_hash != previous_hash
-                                
-                                # Update revisit tracking in a separate file
-                                self._update_revisit_tracking(url, new_content_hash, content_changed)
-                                
                                 return content_changed, previous_hash
                     
                     # URL not found, treat as new content
@@ -1326,6 +1336,82 @@ class CSVStorage:
                     self._flush_batches()
                 return True
             return False
+
+
+    def get_urls_for_revisit(self, max_age_hours: int = 24, limit: int = 100) -> List[Tuple[str, str, int]]:
+        """Get URLs that are due for revisit based on their last visit time."""
+        try:
+            from datetime import datetime
+            revisit_urls = []
+            current_time = datetime.now()
+            
+            if os.path.exists(self.crawler_revisit_file):
+                with open(self.crawler_revisit_file, 'r', encoding='utf-8') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        try:
+                            next_revisit = datetime.fromisoformat(row['next_revisit'])
+                            if next_revisit <= current_time:
+                                # Get the corresponding URL data from discovered_urls file
+                                with open(self.discovered_urls_file, 'r', encoding='utf-8') as df:
+                                    url_reader = csv.DictReader(df)
+                                    for url_row in url_reader:
+                                        if url_row['url'] == row['url']:
+                                            revisit_urls.append((
+                                                url_row['url'],
+                                                url_row['found_on'],
+                                                int(url_row['depth'])
+                                            ))
+                                            break
+                        except (ValueError, KeyError) as e:
+                            logging.error(f"Error processing revisit entry: {e}")
+                            continue
+                            
+                        if len(revisit_urls) >= limit:
+                            break
+                            
+            return revisit_urls[:limit]
+            
+        except Exception as e:
+            logging.error(f"Error getting URLs for revisit: {e}")
+            return []
+
+    def get_unvisited_discovered_urls(self, limit: int = 100) -> List[Tuple[str, str, int]]:
+        """Get unvisited URLs from the discovered URLs file."""
+        try:
+            unvisited_urls = []
+            visited_urls = set()
+            
+            # Load visited URLs into a set for faster lookup
+            if os.path.exists(self.visited_urls_file):
+                with open(self.visited_urls_file, 'r', encoding='utf-8') as f:
+                    reader = csv.DictReader(f)
+                    visited_urls = {row['url'] for row in reader}
+            
+            # Find unvisited URLs from discovered URLs
+            if os.path.exists(self.discovered_urls_file):
+                with open(self.discovered_urls_file, 'r', encoding='utf-8') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        url = row['url']
+                        if url not in visited_urls:
+                            try:
+                                unvisited_urls.append((
+                                    url,
+                                    row['found_on'],
+                                    int(row['depth']) + 1
+                                ))
+                                if len(unvisited_urls) >= limit:
+                                    break
+                            except (ValueError, KeyError) as e:
+                                logging.error(f"Error processing discovered URL entry: {e}")
+                                continue
+            
+            return unvisited_urls[:limit]
+            
+        except Exception as e:
+            logging.error(f"Error getting unvisited URLs: {e}")
+            return []
 
     def url_exists(self, url: str) -> bool:
         """Check if URL exists."""
@@ -2564,6 +2650,7 @@ class ThreadSafeCrawler:
         except Exception as e:
             print(f"Error processing {current_url}: {e}")
             self._categorize_and_log_error(e, current_url)
+            return new_urls
 
         return new_urls
 
@@ -3142,7 +3229,7 @@ def main():
 
     # Incremental Features
     ENABLE_CONTENT_CHANGE_DETECTION = True
-    REVISIT_INTERVAL_HOURS = 24 * 7
+    REVISIT_INTERVAL_HOURS = 24*7 # Check for new URLs every 7 Days
     ENABLE_LANGUAGE_FILTERING = True
     ENABLE_URL_LANGUAGE_FILTERING = True
 
@@ -3205,7 +3292,7 @@ def main():
         # Incremental crawling features
         'enable_content_change_detection': ENABLE_CONTENT_CHANGE_DETECTION,
         'revisit_interval_hours': REVISIT_INTERVAL_HOURS,
-        'max_revisit_urls_per_run': 50,
+        'max_revisit_urls_per_run': 10000,
         'content_change_threshold': 0.1,
         'force_revisit_depth': 1,
 
