@@ -9,7 +9,7 @@ CREATE OR REPLACE CORTEX SEARCH SERVICE <fully_qualified_service_name>
   INITIALIZE = ON_CREATE
   AS 
     SELECT u.*, index, value::string as chunked_data FROM <your_fully_qualified_content_table> u,
-    LATERAL FLATTEN(input => SNOWFLAKE.CORTEX.SPLIT_TEXT_RECURSIVE_CHARACTER (cleaned_text,'markdown',2000,300);
+    LATERAL FLATTEN(input => SNOWFLAKE.CORTEX.SPLIT_TEXT_RECURSIVE_CHARACTER (cleaned_text,'markdown',2000,300));
 
 
 -- Cortex Search Preview query
