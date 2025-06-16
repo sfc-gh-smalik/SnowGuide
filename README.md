@@ -126,7 +126,28 @@ The crawler provides real - time telemetry including: - Pages processed per seco
 ## License
 This code is provided as - is. Use at your own risk.
 
-
 **Contributing**
   - Feel free to submit issues and enhancement requests.
 
+
+# .env File
+
+| Variable | Required| Description|
+| -------- | ------- | ------- |
+|**COMMON**|
+|SNOWFLAKE_DATABASE|YES||
+|SNOWFLAKE_SCHEMA|YES||
+|SNOWFLAKE_WAREHOUSE|YES||
+|SNOWFLAKE_USER|YES||
+|SNOWFLAKE_USER_ROLE|YES||
+|SNOWFLAKE_ACCOUNT|YES|\<ORG-ACCOUNT>|
+|HOST||\<ORG-ACCOUNT>.snowflakecomputing.com|
+|SNOWFLAKE_PASSWORD||If required then use a Programmatic Access Token|
+||
+|**SLACK BOT SPECIFIC**|
+|SLACK_BOT_TOKEN|YES||
+|SLACK_SIGNING_SECRET|YES||
+|SLACK_APP_TOKEN|YES||
+|SLACK_USER_TOKEN|YES||
+|LLM_API||cortex &#124; openai|
+|OPENAI_API_KEY||Only required when LLM_API=openai|
