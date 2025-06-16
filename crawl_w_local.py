@@ -892,27 +892,6 @@ def upload_csv_to_snowflake(snowflake_config: dict, table_prefix: str) -> bool:
             snow_df = snow_df.withColumn("CREATED_AT", current_timestamp())
             snow_df = snow_df.withColumn("UPDATED_AT", current_timestamp())
 
-            # # Convert empty strings to NULL for VARIANT columns
-            # snow_df = snow_df.withColumn("HEADINGS", 
-            #     when(col("HEADINGS") == "{}", None)
-            #     .when(col("HEADINGS") == "", None)
-            #     .otherwise(col("HEADINGS")))
-
-            # snow_df = snow_df.withColumn("EXTRACTED_LINKS", 
-            #     when(col("EXTRACTED_LINKS") == "[]", None)
-            #     .when(col("EXTRACTED_LINKS") == "", None)
-            #     .otherwise(col("EXTRACTED_LINKS")))
-
-            # snow_df = snow_df.withColumn("IMAGES", 
-            #     when(col("IMAGES") == "{}", None)
-            #     .when(col("IMAGES") == "", None)
-            #     .otherwise(col("IMAGES")))
-
-            # snow_df = snow_df.withColumn("STRUCTURED_DATA", 
-            #     when(col("STRUCTURED_DATA") == "{}", None)
-            #     .when(col("STRUCTURED_DATA") == "", None)
-            #     .otherwise(col("STRUCTURED_DATA")))
-
             # Create temp table for merge operation
             temp_table = "TEMP_DISCOVERED_URLS"
             snow_df.write.mode("overwrite").save_as_table(temp_table)
