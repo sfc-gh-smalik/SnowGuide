@@ -1073,6 +1073,22 @@ class CSVStorage:
                     reader = csv.DictReader(f)
                     self.url_cache = {row['url'] for row in reader}
 
+            # Load revisit tracking data
+            if os.path.exists(self.crawler_revisit_file):
+                with open(self.crawler_revisit_file, 'r', encoding='utf-8') as f:
+                    reader = csv.DictReader(f)
+                    self.revisit_tracking = {
+                        row['url']: {
+                            'last_hash': row['last_hash'],
+                            'last_revisit': row['last_revisit'],
+                            'next_revisit': row['next_revisit'],
+                            'revisit_interval_hours': int(row['revisit_interval_hours']),
+                            'consecutive_unchanged': int(row['consecutive_unchanged'])
+                        } for row in reader
+                    }
+            else:
+                self.revisit_tracking = {}
+
         except Exception as e:
             logging.error(f"Error loading caches: {e}")
 
@@ -1087,7 +1103,8 @@ class CSVStorage:
             tables_to_check = [
                 (f"{self.table_prefix}_DISCOVERED_URLS", self.discovered_urls_file),
                 (f"{self.table_prefix}_VISITED_URLS", self.visited_urls_file),
-                (f"{self.table_prefix}_CONTENT_HASHES", self.content_hashes_file)
+                (f"{self.table_prefix}_CONTENT_HASHES", self.content_hashes_file),
+                (f"{self.table_prefix}_REVISIT_SCHEDULE", self.crawler_revisit_file)  # Added revisit schedule table
             ]
             
             for table_name, csv_file in tables_to_check:
@@ -1100,6 +1117,9 @@ class CSVStorage:
                         # Export table data to CSV
                         query = f"SELECT * FROM {table_name}"
                         df = session.sql(query).to_pandas()
+
+                        # Convert column names to lowercase
+                        df.columns = df.columns.str.lower()
                         
                         # Write to CSV file
                         df.to_csv(csv_file, index=False)
@@ -1163,46 +1183,37 @@ class CSVStorage:
             except Exception as e:
                 print(f"Error flushing batches: {e}")
 
-    # def check_content_change(self, url: str, new_content_hash: str) -> Tuple[bool, str]:
-    #     """Check if content has changed."""
-    #     with self.lock:
-    #         try:
-    #             if os.path.exists(self.discovered_urls_file):
-    #                 with open(self.discovered_urls_file, 'r', encoding='utf-8') as f:
-    #                     reader = csv.DictReader(f)
-    #                     for row in reader:
-    #                         if row['url'] == url:
-    #                             return new_content_hash != row['content_hash'], row['content_hash']
-    #             return True, ""
-    #         except Exception as e:
-    #             logging.error(f"Error checking content change: {e}")
-    #             return True, ""
-
     def check_content_change(self, url: str, new_content_hash: str) -> Tuple[bool, str]:
         """Check if content has changed for CSV storage mode."""
-        # print('***************Sunny checking content*************')
         with self.lock:
             try:
                 if os.path.exists(self.discovered_urls_file):
                     with open(self.discovered_urls_file, 'r', encoding='utf-8') as f:
                         reader = csv.DictReader(f)
+                        # Convert column names to lowercase for case-insensitive matching
+                        fieldnames = {name.lower(): name for name in reader.fieldnames}
+                        
                         for row in reader:
-                            if row['url'] == url:
-                                previous_hash = row.get('content_hash', '')
+                            if row[fieldnames['url']].strip() == url:
+                                previous_hash = row[fieldnames['content_hash']].strip()
                                 content_changed = new_content_hash != previous_hash
-
+                                
                                 # Update revisit tracking in a separate file
-                                # print('***************Sunny Update revisit tracking*************')
                                 self._update_revisit_tracking(url, new_content_hash, content_changed)
-
+                                
                                 return content_changed, previous_hash
-
-                # URL not found, treat as new content
+                    
+                    # URL not found, treat as new content
+                    return True, ""
+                
+                # File doesn't exist, treat as new content
                 return True, ""
-
+                
             except Exception as e:
-                print(f"*************Error checking content change: {e}")
+                print(f"*****Error checking content change: {e}")
                 return True, ""
+
+
 
     def _update_revisit_tracking(self, url: str, new_hash: str, content_changed: bool):
         """Update revisit tracking information in CSV."""
@@ -1390,10 +1401,9 @@ def upload_csv_to_snowflake(snowflake_config: dict, table_prefix: str) -> bool:
             BooleanType, VariantType
         import pandas as pd
         import os
-        from snowflake.snowpark.functions import col
+        from snowflake.snowpark.functions import col, lit, current_timestamp, when
 
         # Create Snowpark session
-
         try:
             session = Session.builder.configs(snowflake_config).create()
         except Exception as e:
@@ -1408,11 +1418,13 @@ def upload_csv_to_snowflake(snowflake_config: dict, table_prefix: str) -> bool:
         discovered_urls_table = f"{table_prefix}_DISCOVERED_URLS"
         visited_urls_table = f"{table_prefix}_VISITED_URLS"
         content_hashes_table = f"{table_prefix}_CONTENT_HASHES"
+        revisit_schedule_table = f"{table_prefix}_REVISIT_SCHEDULE"
 
         # Define file paths
         discovered_urls_file = f"{table_prefix}_discovered_urls.csv"
         visited_urls_file = f"{table_prefix}_visited_urls.csv"
         content_hashes_file = f"{table_prefix}_content_hashes.csv"
+        revisit_tracking_file = f"{table_prefix}_revisit_tracking.csv"
 
         # Create tables if they don't exist
         create_discovered_urls = f"""
@@ -1459,7 +1471,21 @@ def upload_csv_to_snowflake(snowflake_config: dict, table_prefix: str) -> bool:
                 )
                 """
 
+        # Create revisit tracking table if it doesn't exist
+        create_revisit_schedule = f"""
+            CREATE TABLE IF NOT EXISTS {revisit_schedule_table} (
+                URL STRING PRIMARY KEY,
+                LAST_HASH STRING,
+                LAST_REVISIT TIMESTAMP_NTZ,
+                NEXT_REVISIT TIMESTAMP_NTZ,
+                REVISIT_INTERVAL_HOURS NUMBER DEFAULT 24,
+                CONSECUTIVE_UNCHANGED NUMBER DEFAULT 0,
+                CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+            )
+        """
+        
         # Execute create table statements
+        session.sql(create_revisit_schedule).collect()
         session.sql(create_discovered_urls).collect()
         session.sql(create_visited_urls).collect()
         session.sql(create_content_hashes).collect()
@@ -1473,9 +1499,45 @@ def upload_csv_to_snowflake(snowflake_config: dict, table_prefix: str) -> bool:
             # Convert pandas DataFrame directly to Snowpark DataFrame
             snow_df = session.create_dataframe(df)
 
+            # # Create temp table for merge operation
+            # temp_table = "TEMP_DISCOVERED_URLS"
+            # snow_df.write.mode("overwrite").save_as_table(temp_table)
+
+
+            # Add missing columns with default values
+            snow_df = snow_df.withColumn("LAST_VISITED", current_timestamp())
+            snow_df = snow_df.withColumn("CREATED_AT", current_timestamp())
+            snow_df = snow_df.withColumn("UPDATED_AT", current_timestamp())
+            
+            # Convert empty strings to NULL for VARIANT columns
+            snow_df = snow_df.withColumn("HEADINGS", 
+                when(col("HEADINGS") == "{}", None)
+                .when(col("HEADINGS") == "", None)
+                .otherwise(col("HEADINGS")))
+            
+            snow_df = snow_df.withColumn("EXTRACTED_LINKS", 
+                when(col("EXTRACTED_LINKS") == "[]", None)
+                .when(col("EXTRACTED_LINKS") == "", None)
+                .otherwise(col("EXTRACTED_LINKS")))
+            
+            snow_df = snow_df.withColumn("IMAGES", 
+                when(col("IMAGES") == "{}", None)
+                .when(col("IMAGES") == "", None)
+                .otherwise(col("IMAGES")))
+            
+            snow_df = snow_df.withColumn("STRUCTURED_DATA", 
+                when(col("STRUCTURED_DATA") == "{}", None)
+                .when(col("STRUCTURED_DATA") == "", None)
+                .otherwise(col("STRUCTURED_DATA")))
+
+            # Convert empty strings to NULL for numeric columns
+            snow_df = snow_df.withColumn("CONTENT_SIZE", 
+                col("CONTENT_SIZE"))
+
             # Create temp table for merge operation
             temp_table = "TEMP_DISCOVERED_URLS"
             snow_df.write.mode("overwrite").save_as_table(temp_table)
+
 
             # Perform merge operation
             merge_query = f"""
@@ -1557,6 +1619,47 @@ def upload_csv_to_snowflake(snowflake_config: dict, table_prefix: str) -> bool:
             session.sql(merge_query).collect()
             session.sql(f"DROP TABLE IF EXISTS {temp_table}").collect()
             print(f"✓ Merged {len(df)} rows into {content_hashes_table}")
+
+
+        # Upload revisit tracking data
+        if os.path.exists(revisit_tracking_file):
+            df = pd.read_csv(revisit_tracking_file)
+            df.columns = df.columns.str.upper()
+
+            # Convert pandas DataFrame to Snowpark DataFrame
+            snow_df = session.create_dataframe(df)
+
+            # Create temp table for merge operation
+            temp_table = "TEMP_REVISIT_SCHEDULE"
+            snow_df.write.mode("overwrite").save_as_table(temp_table)
+
+            # Perform merge operation
+            merge_query = f"""
+            MERGE INTO {revisit_schedule_table} target
+            USING {temp_table} source
+            ON target.URL = source.URL
+            WHEN MATCHED THEN UPDATE SET
+                LAST_HASH = source.LAST_HASH,
+                LAST_REVISIT = source.LAST_REVISIT::TIMESTAMP_NTZ,
+                NEXT_REVISIT = source.NEXT_REVISIT::TIMESTAMP_NTZ,
+                REVISIT_INTERVAL_HOURS = source.REVISIT_INTERVAL_HOURS,
+                CONSECUTIVE_UNCHANGED = source.CONSECUTIVE_UNCHANGED,
+                CREATED_AT = CURRENT_TIMESTAMP()
+            WHEN NOT MATCHED THEN INSERT (
+                URL, LAST_HASH, LAST_REVISIT, NEXT_REVISIT,
+                REVISIT_INTERVAL_HOURS, CONSECUTIVE_UNCHANGED
+            ) VALUES (
+                source.URL, source.LAST_HASH,
+                source.LAST_REVISIT::TIMESTAMP_NTZ,
+                source.NEXT_REVISIT::TIMESTAMP_NTZ,
+                source.REVISIT_INTERVAL_HOURS,
+                source.CONSECUTIVE_UNCHANGED
+            )
+            """
+            session.sql(merge_query).collect()
+            session.sql(f"DROP TABLE IF EXISTS {temp_table}").collect()
+            print(f"✓ Merged {len(df)} rows into {revisit_schedule_table}")
+
 
         session.close()
         return True
@@ -1951,7 +2054,7 @@ class ThreadSafeCrawler:
         self.error_lock = threading.Lock()
 
         # Setup enhanced logging with thread safety
-        log_level = logging.DEBUG if self.debug_mode else logging.INFO
+        log_level = logging.ERROR if self.debug_mode else logging.INFO
         self._setup_logging(log_level)
 
         # Memory monitoring
