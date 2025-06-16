@@ -2098,13 +2098,7 @@ class ThreadSafeCrawler:
 
         else:
             # CSV Storage configuration
-            csv_config = {
-                # 'output_dir': config.get('output_dir', './crawler_data'),
-                # 'urls_file': config.get('urls_file', 'discovered_urls.csv'),
-                # 'state_file': config.get('state_file', 'crawler_state.json'),
-                # 'content_dir': config.get('content_dir', 'page_content'),
-                # 'compress_content': config.get('compress_content', False)
-            }
+            csv_config = {}
             self.storage = CSVStorage(**csv_config)
             print("Using CSV file storage with content capabilities")
 
@@ -3261,7 +3255,7 @@ def main():
 
     # Incremental Features
     ENABLE_CONTENT_CHANGE_DETECTION = True
-    REVISIT_INTERVAL_HOURS = 0.1 # Check for new URLs every 7 Days
+    REVISIT_INTERVAL_HOURS = 24*7 # Check for new URLs every 7 Days
     ENABLE_LANGUAGE_FILTERING = True
     ENABLE_URL_LANGUAGE_FILTERING = True
 
@@ -3287,13 +3281,6 @@ def main():
 
         # Storage configuration
         'use_database': USE_DATABASE,  # Set to False for CSV storage
-
-        # CSV Storage configuration (only used if use_database=False)
-        'output_dir': './crawler_data',
-        'urls_file': 'discovered_urls.csv',
-        'state_file': 'crawler_state.json',
-        'content_dir': 'page_content',
-        'compress_content': False,
 
         # Crawling targets
         'starting_urls': STARTING_URLS,
@@ -3460,3 +3447,7 @@ def main():
 
         if config['store_raw_html'] or config['store_cleaned_text']:
             print("🎉 Content storage features were enabled - check your database for rich content data!")
+
+
+if __name__ == "__main__":
+    main()
