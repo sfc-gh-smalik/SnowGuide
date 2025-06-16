@@ -1183,13 +1183,14 @@ class CSVStorage:
                                 next_revisit_time,               # NEXT_REVISIT_TIME
                                 current_time,                    # CREATED_AT
                                 current_time,                    # UPDATED_AT
+                                '',                              # RAW_HTML
                                 result.cleaned_text,             # CLEANED_TEXT
                                 result.content_size or 0,        # CONTENT_SIZE
                                 result.content_type,             # CONTENT_TYPE
+                                json.dumps(result.extracted_links), # EXTRACTED_LINKS
                                 result.meta_description,         # META_DESCRIPTION
                                 result.meta_keywords,            # META_KEYWORDS
                                 json.dumps(result.headings),     # HEADINGS
-                                json.dumps(result.extracted_links), # EXTRACTED_LINKS
                                 json.dumps(result.images),       # IMAGES
                                 json.dumps(result.structured_data) # STRUCTURED_DATA
                             ])
@@ -1483,8 +1484,8 @@ def upload_csv_to_snowflake(snowflake_config: dict, table_prefix: str) -> bool:
     """
     try:
         from snowflake.snowpark import Session
-        from snowflake.snowpark.types import StructType, StructField, StringType, IntegerType, TimestampType, \
-            BooleanType, VariantType
+        # from snowflake.snowpark.types import StructType, StructField, StringType, IntegerType, TimestampType, \
+        #     BooleanType, VariantType
         import pandas as pd
         import os
         from snowflake.snowpark.functions import col, lit, current_timestamp, when
@@ -1498,6 +1499,7 @@ def upload_csv_to_snowflake(snowflake_config: dict, table_prefix: str) -> bool:
                 session = get_active_session()
             except Exception as e:
                 print('FATAL Error : Unable to connect to Snowflake Environment')
+                return False
                 
 
         # Define table names
@@ -1580,45 +1582,75 @@ def upload_csv_to_snowflake(snowflake_config: dict, table_prefix: str) -> bool:
         if os.path.exists(discovered_urls_file):
             # Read CSV into pandas DataFrame
             df = pd.read_csv(discovered_urls_file)
+            
+            # Define the expected column order matching Snowflake schema
+            expected_columns = [
+                'URL',
+                'FOUND_ON',
+                'DEPTH',
+                'TIMESTAMP',
+                'CONTENT_HASH',
+                'PAGE_TITLE',
+                'STATUS_CODE',
+                'LANGUAGE',
+                'LAST_VISITED',
+                'CONTENT_CHANGED',
+                'PREVIOUS_HASH',
+                'VISIT_COUNT',
+                'NEXT_REVISIT_TIME',
+                'CREATED_AT',
+                'UPDATED_AT',
+                'CLEANED_TEXT',
+                'CONTENT_SIZE',
+                'CONTENT_TYPE',
+                'META_DESCRIPTION',
+                'META_KEYWORDS',
+                'HEADINGS',
+                'EXTRACTED_LINKS',
+                'IMAGES',
+                'STRUCTURED_DATA'
+            ]
+
+            # Convert column names to uppercase
             df.columns = df.columns.str.upper()
 
-            # Convert pandas DataFrame directly to Snowpark DataFrame
-            snow_df = session.create_dataframe(df)
+            # Create a new DataFrame with columns in the correct order
+            # Fill missing columns with None/null values
+            mapped_df = pd.DataFrame(columns=expected_columns)
+            for cols in expected_columns:
+                if cols in df.columns:
+                    mapped_df[cols] = df[cols]
+                else:
+                    mapped_df[cols] = None
 
-            # # Create temp table for merge operation
-            # temp_table = "TEMP_DISCOVERED_URLS"
-            # snow_df.write.mode("overwrite").save_as_table(temp_table)
-
+            # Convert pandas DataFrame to Snowpark DataFrame
+            snow_df = session.create_dataframe(mapped_df)
 
             # Add missing columns with default values
             snow_df = snow_df.withColumn("LAST_VISITED", current_timestamp())
             snow_df = snow_df.withColumn("CREATED_AT", current_timestamp())
             snow_df = snow_df.withColumn("UPDATED_AT", current_timestamp())
             
-            # Convert empty strings to NULL for VARIANT columns
-            snow_df = snow_df.withColumn("HEADINGS", 
-                when(col("HEADINGS") == "{}", None)
-                .when(col("HEADINGS") == "", None)
-                .otherwise(col("HEADINGS")))
+            # # Convert empty strings to NULL for VARIANT columns
+            # snow_df = snow_df.withColumn("HEADINGS", 
+            #     when(col("HEADINGS") == "{}", None)
+            #     .when(col("HEADINGS") == "", None)
+            #     .otherwise(col("HEADINGS")))
             
-            snow_df = snow_df.withColumn("EXTRACTED_LINKS", 
-                when(col("EXTRACTED_LINKS") == "[]", None)
-                .when(col("EXTRACTED_LINKS") == "", None)
-                .otherwise(col("EXTRACTED_LINKS")))
+            # snow_df = snow_df.withColumn("EXTRACTED_LINKS", 
+            #     when(col("EXTRACTED_LINKS") == "[]", None)
+            #     .when(col("EXTRACTED_LINKS") == "", None)
+            #     .otherwise(col("EXTRACTED_LINKS")))
             
-            snow_df = snow_df.withColumn("IMAGES", 
-                when(col("IMAGES") == "{}", None)
-                .when(col("IMAGES") == "", None)
-                .otherwise(col("IMAGES")))
+            # snow_df = snow_df.withColumn("IMAGES", 
+            #     when(col("IMAGES") == "{}", None)
+            #     .when(col("IMAGES") == "", None)
+            #     .otherwise(col("IMAGES")))
             
-            snow_df = snow_df.withColumn("STRUCTURED_DATA", 
-                when(col("STRUCTURED_DATA") == "{}", None)
-                .when(col("STRUCTURED_DATA") == "", None)
-                .otherwise(col("STRUCTURED_DATA")))
-
-            # Convert empty strings to NULL for numeric columns
-            snow_df = snow_df.withColumn("CONTENT_SIZE", 
-                col("CONTENT_SIZE"))
+            # snow_df = snow_df.withColumn("STRUCTURED_DATA", 
+            #     when(col("STRUCTURED_DATA") == "{}", None)
+            #     .when(col("STRUCTURED_DATA") == "", None)
+            #     .otherwise(col("STRUCTURED_DATA")))
 
             # Create temp table for merge operation
             temp_table = "TEMP_DISCOVERED_URLS"
@@ -3229,7 +3261,7 @@ def main():
 
     # Incremental Features
     ENABLE_CONTENT_CHANGE_DETECTION = True
-    REVISIT_INTERVAL_HOURS = 24*7 # Check for new URLs every 7 Days
+    REVISIT_INTERVAL_HOURS = 0.1 # Check for new URLs every 7 Days
     ENABLE_LANGUAGE_FILTERING = True
     ENABLE_URL_LANGUAGE_FILTERING = True
 
