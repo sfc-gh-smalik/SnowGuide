@@ -293,32 +293,79 @@ class CSVStorage:
         # Create files if they don't exist
         self._create_files()
         self._load_caches()
+        
 
     def _create_files(self):
-        """Create CSV files with headers if they don't exist."""
+        """Create CSV files with headers and validate column structure."""
         with self.lock:
-            # Discovered URLs file
-            if not os.path.exists(self.discovered_urls_file):
-                with open(self.discovered_urls_file, 'w', newline='', encoding='utf-8') as f:
-                    writer = csv.writer(f)
-                    writer.writerow(['url', 'found_on', 'depth', 'timestamp', 'content_hash',
-                                     'page_title', 'status_code', 'language', 'last_visited',
-                                     'content_changed', 'previous_hash', 'visit_count',
-                                     'cleaned_text', 'content_size', 'content_type',
-                                     'meta_description', 'meta_keywords', 'headings',
-                                     'extracted_links', 'images', 'structured_data'])
+            # Define expected columns for each file
+            discovered_urls_columns = [
+                'url', 'found_on', 'depth', 'timestamp', 'content_hash',
+                'page_title', 'status_code', 'language', 'last_visited',
+                'content_changed', 'previous_hash', 'visit_count',
+                'next_revisit_time', 'created_at', 'updated_at',
+                'cleaned_text', 'content_size', 'content_type',
+                'extracted_links', 'meta_description', 'meta_keywords',
+                'headings', 'images', 'structured_data'
+            ]
 
-            # Visited URLs file
-            if not os.path.exists(self.visited_urls_file):
-                with open(self.visited_urls_file, 'w', newline='', encoding='utf-8') as f:
-                    writer = csv.writer(f)
-                    writer.writerow(['url', 'visited_at'])
+            visited_urls_columns = ['url', 'visited_at']
+            content_hashes_columns = ['content_hash', 'first_url', 'created_at']
+            
+            # Helper function to validate and create file
+            def validate_and_create_file(filepath, expected_columns):
+                needs_creation = True
+                if os.path.exists(filepath):
+                    try:
+                        with open(filepath, 'r', newline='', encoding='utf-8') as f:
+                            reader = csv.reader(f)
+                            existing_columns = next(reader, [])
+                            if existing_columns == expected_columns:
+                                needs_creation = False
+                            else:
+                                print(f"Invalid column structure in {filepath}. Recreating file.")
+                    except Exception as e:
+                        print(f"Error reading {filepath}: {e}. Recreating file.")
+                
+                if needs_creation:
+                    with open(filepath, 'w', newline='', encoding='utf-8') as f:
+                        writer = csv.writer(f)
+                        writer.writerow(expected_columns)
+                    print(f"Created {filepath} with {len(expected_columns)} columns")
+            
+            # Create and validate each file
+            validate_and_create_file(self.discovered_urls_file, discovered_urls_columns)
+            validate_and_create_file(self.visited_urls_file, visited_urls_columns)
+            validate_and_create_file(self.content_hashes_file, content_hashes_columns)
+            
+            # Validate file creation
+            files_to_check = [
+                (self.discovered_urls_file, discovered_urls_columns),
+                (self.visited_urls_file, visited_urls_columns),
+                (self.content_hashes_file, content_hashes_columns)
+            ]
+            
+            validation_errors = []
+            for filepath, expected_columns in files_to_check:
+                if not os.path.exists(filepath):
+                    validation_errors.append(f"Failed to create {filepath}")
+                else:
+                    try:
+                        with open(filepath, 'r', newline='', encoding='utf-8') as f:
+                            reader = csv.reader(f)
+                            actual_columns = next(reader, [])
+                            if actual_columns != expected_columns:
+                                validation_errors.append(
+                                    f"Column mismatch in {filepath}. "
+                                    f"Expected {len(expected_columns)} columns, got {len(actual_columns)}"
+                                )
+                    except Exception as e:
+                        validation_errors.append(f"Error validating {filepath}: {e}")
+            
+            if validation_errors:
+                error_msg = "\n".join(validation_errors)
+                raise RuntimeError(f"File validation failed:\n{error_msg}")
 
-            # Content hashes file
-            if not os.path.exists(self.content_hashes_file):
-                with open(self.content_hashes_file, 'w', newline='', encoding='utf-8') as f:
-                    writer = csv.writer(f)
-                    writer.writerow(['content_hash', 'first_url', 'created_at'])
 
     def _load_caches(self):
         """Load existing data into memory caches."""
@@ -393,11 +440,11 @@ class CSVStorage:
 
             # Check if Snowflake tables exist and create corresponding CSV files
             tables_to_check = [
-                (f"{self.table_prefix}_DISCOVERED_URLS", self.discovered_urls_file),
-                (f"{self.table_prefix}_VISITED_URLS", self.visited_urls_file),
-                (f"{self.table_prefix}_CONTENT_HASHES", self.content_hashes_file),
-                (f"{self.table_prefix}_REVISIT_SCHEDULE", self.crawler_revisit_file),  # Added revisit schedule table
-                (f"{self.table_prefix}_STATE", self.crawler_state_file)  # Added state table
+                (f"{self.table_prefix.upper()}_DISCOVERED_URLS", self.discovered_urls_file),
+                (f"{self.table_prefix.upper()}_VISITED_URLS", self.visited_urls_file),
+                (f"{self.table_prefix.upper()}_CONTENT_HASHES", self.content_hashes_file),
+                (f"{self.table_prefix.upper()}_REVISIT_SCHEDULE", self.crawler_revisit_file),  # Added revisit schedule table
+                (f"{self.table_prefix.upper()}_STATE", self.crawler_state_file)  # Added state table
             ]
 
             for table_name, csv_file in tables_to_check:
@@ -431,11 +478,11 @@ class CSVStorage:
                         print(f"Generated {csv_file} from {table_name}")
 
                 except Exception as e:
-                    logging.warning(f"Could not generate {csv_file} from {table_name}: {e}")
+                    print(f"Could not generate {csv_file} from {table_name}: {e}")
                     continue
 
         except Exception as e:
-            logging.warning(f"Could not connect to Snowflake to generate local files: {e}")
+            print(f"Could not connect to Snowflake to generate local files: {e}")
 
     def _flush_batches(self):
         """Flush all pending batches to CSV files with complete column set."""
@@ -486,7 +533,7 @@ class CSVStorage:
                                 next_revisit_time,  # NEXT_REVISIT_TIME
                                 current_time,  # CREATED_AT
                                 current_time,  # UPDATED_AT
-                                '',  # RAW_HTML
+                                # '',  # RAW_HTML
                                 result.cleaned_text,  # CLEANED_TEXT
                                 result.content_size or 0,  # CONTENT_SIZE
                                 result.content_type,  # CONTENT_TYPE
@@ -1515,7 +1562,7 @@ class ThreadSafeCrawler:
             format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s',
             handlers=[
                 logging.FileHandler('crawler_debug.log'),
-                logging.StreamHandler()
+                # logging.StreamHandler()
             ]
         )
         self.logger = logging.getLogger(__name__)
@@ -2504,18 +2551,6 @@ class ThreadSafeCrawler:
             for category, count in self.error_categories.items():
                 print(f"  {category}: {count:,}")
 
-        # Show content storage statistics if available
-        if hasattr(self.storage, 'get_content_statistics'):
-            content_stats = self.storage.get_content_statistics()
-            if content_stats:
-                print("\nContent storage statistics:")
-                if 'content_size' in content_stats:
-                    size_info = content_stats['content_size']
-                    print(f"  Average content size: {size_info.get('average', 0):.0f} bytes")
-                    print(f"  Total pages with content: {size_info.get('total_pages', 0):,}")
-                if 'meta_description_coverage' in content_stats:
-                    print(f"  Meta description coverage: {content_stats['meta_description_coverage']:.1f}%")
-
         print("=" * 60)
 
 
@@ -2633,7 +2668,7 @@ def main():
         # Incremental crawling features
         'enable_content_change_detection': ENABLE_CONTENT_CHANGE_DETECTION,
         'revisit_interval_hours': REVISIT_INTERVAL_HOURS,
-        'max_revisit_urls_per_run': 10000,
+        'max_revisit_urls_per_run': 15000,
         'content_change_threshold': 0.1,
         'force_revisit_depth': 1,
 
