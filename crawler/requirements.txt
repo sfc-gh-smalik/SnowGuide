@@ -1,0 +1,7 @@
+requests
+bs4
+langdetect
+psutil
+snowflake-snowpark-python
+pandas
+python-dotenv

@@ -1,0 +1,16 @@
+# Sample .env file
+SNOWFLAKE_DATABASE='{{database}}'
+SNOWFLAKE_SCHEMA='{{schema}}'
+SNOWFLAKE_WAREHOUSE='{{warehouse name}}'
+SNOWFLAKE_USER='{{user}}'
+SNOWFLAKE_USER_ROLE='{{role}}'
+SNOWFLAKE_ACCOUNT='{{organization}}={{account}}'
+HOST='{{organization}}={{account}}.snowflakecomputing.com'
+SNOWFLAKE_HOST=${HOST}
+SNOWFLAKE_PASSWORD='(optional. use PAT if needed)'
+SLACK_BOT_TOKEN='{{slackbot_token}}'
+SLACK_SIGNING_SECRET='{{slackbot_secret}}'
+SLACK_APP_TOKEN='{{slackbot_app_token}}'
+SLACK_USER_TOKEN='{{slackbot_user_token}}'
+OPENAI_API_KEY='(Optional. Required if LLM_API=openai)'
+LLM_API=openai  # or cortex

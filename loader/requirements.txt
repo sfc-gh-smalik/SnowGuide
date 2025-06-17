@@ -1,0 +1,11 @@
+bs4
+flask
+langdetect
+pandas
+psutil
+pycurl
+python-dotenv
+requests
+snowflake-connector-python
+snowflake-snowpark-python
+snowflake.core

@@ -2803,3 +2803,7 @@ def main():
 
         if config['store_raw_html'] or config['store_cleaned_text']:
             print("🎉 Content storage features were enabled - check your database for rich content data!")
+
+
+if (__name__ == '__main__'):
+    main()

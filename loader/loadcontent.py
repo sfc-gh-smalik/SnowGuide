@@ -129,3 +129,7 @@ def post_process_missing_content(batch_size: int = 50, max_retries: int = 3):
         print(f"\nProgress: {min(i + batch_size, total_urls)}/{total_urls} URLs processed")
 
     print("\nContent post-processing completed!")
+
+
+if (__name__ == "__main__"):
+    post_process_missing_content
