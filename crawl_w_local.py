@@ -322,6 +322,7 @@ class CSVStorage:
 
     def _load_caches(self):
         """Load existing data into memory caches."""
+        from datetime import datetime
         try:
             # Load visited URLs
             if os.path.exists(self.visited_urls_file):
@@ -357,6 +358,30 @@ class CSVStorage:
             else:
                 self.revisit_tracking = {}
 
+
+            # Load state file
+            if os.path.exists(self.crawler_state_file):
+                with open(self.crawler_state_file, 'r', encoding='utf-8') as f:
+                    try:
+                        self.state_data = json.load(f)
+                    except json.JSONDecodeError:
+                        self.state_data = {
+                            'pending_urls': [],
+                            'pages_processed': 0,
+                            'new_urls_found': 0,
+                            'error_categories': {},
+                            'timestamp': datetime.now().isoformat()
+                        }
+            else:
+                self.state_data = {
+                    'pending_urls': [],
+                    'pages_processed': 0,
+                    'new_urls_found': 0,
+                    'error_categories': {},
+                    'timestamp': datetime.now().isoformat()
+                }
+
+
         except Exception as e:
             logging.error(f"Error loading caches: {e}")
 
@@ -371,7 +396,8 @@ class CSVStorage:
                 (f"{self.table_prefix}_DISCOVERED_URLS", self.discovered_urls_file),
                 (f"{self.table_prefix}_VISITED_URLS", self.visited_urls_file),
                 (f"{self.table_prefix}_CONTENT_HASHES", self.content_hashes_file),
-                (f"{self.table_prefix}_REVISIT_SCHEDULE", self.crawler_revisit_file)  # Added revisit schedule table
+                (f"{self.table_prefix}_REVISIT_SCHEDULE", self.crawler_revisit_file),  # Added revisit schedule table
+                (f"{self.table_prefix}_STATE", self.crawler_state_file)  # Added state table
             ]
 
             for table_name, csv_file in tables_to_check:
@@ -388,8 +414,19 @@ class CSVStorage:
                         # Convert column names to lowercase
                         df.columns = df.columns.str.lower()
 
-                        # Write to CSV file
-                        df.to_csv(csv_file, index=False)
+                        # Special handling for state table - convert to JSON
+                        if table_name.endswith('_STATE'):
+                            if not df.empty:
+                                # Get the latest state record
+                                latest_state = df.iloc[-1].to_dict()
+                                import json
+                                with open(csv_file, 'w') as f:
+                                    json.dump(latest_state, f)
+
+                        else:
+                            # Write to CSV file
+                            df.to_csv(csv_file, index=False)
+                            
                         # logging.info(f"Generated {csv_file} from {table_name}")
                         print(f"Generated {csv_file} from {table_name}")
 
@@ -768,12 +805,16 @@ def upload_csv_to_snowflake(snowflake_config: dict, table_prefix: str) -> bool:
         visited_urls_table = f"{table_prefix}_VISITED_URLS"
         content_hashes_table = f"{table_prefix}_CONTENT_HASHES"
         revisit_schedule_table = f"{table_prefix}_REVISIT_SCHEDULE"
+        state_table = f"{table_prefix}_STATE"
+
 
         # Define file paths
         discovered_urls_file = f"{table_prefix}_discovered_urls.csv"
         visited_urls_file = f"{table_prefix}_visited_urls.csv"
         content_hashes_file = f"{table_prefix}_content_hashes.csv"
         revisit_tracking_file = f"{table_prefix}_revisit_tracking.csv"
+        state_file = f"{table_prefix}_state.json"
+
 
         # Create tables if they don't exist
         create_discovered_urls = f"""
@@ -833,11 +874,26 @@ def upload_csv_to_snowflake(snowflake_config: dict, table_prefix: str) -> bool:
             )
         """
 
+        # Create state table if it doesn't exist
+        create_state_table = f"""
+        CREATE TABLE IF NOT EXISTS {state_table} (
+            STATE_ID NUMBER IDENTITY PRIMARY KEY,
+            PENDING_URLS VARIANT,
+            PAGES_PROCESSED NUMBER,
+            NEW_URLS_FOUND NUMBER,
+            ERROR_CATEGORIES VARIANT,
+            TIMESTAMP TIMESTAMP_NTZ,
+            CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+        )
+        """
+        
+
         # Execute create table statements
         session.sql(create_revisit_schedule).collect()
         session.sql(create_discovered_urls).collect()
         session.sql(create_visited_urls).collect()
         session.sql(create_content_hashes).collect()
+        session.sql(create_state_table).collect()
 
         # Upload discovered URLs
         if os.path.exists(discovered_urls_file):
@@ -1015,6 +1071,45 @@ def upload_csv_to_snowflake(snowflake_config: dict, table_prefix: str) -> bool:
             session.sql(merge_query).collect()
             session.sql(f"DROP TABLE IF EXISTS {temp_table}").collect()
             print(f"✓ Merged {len(df)} rows into {revisit_schedule_table}")
+
+        # Upload state data if file exists
+        if os.path.exists(state_file):
+            try:
+                with open(state_file, 'r') as f:
+                    state_data = json.load(f)
+                
+                # Format state data for Snowflake
+                formatted_state = {
+                    'PENDING_URLS': json.dumps(state_data.get('pending_urls', [])),
+                    'PAGES_PROCESSED': state_data.get('pages_processed', 0),
+                    'NEW_URLS_FOUND': state_data.get('new_urls_found', 0),
+                    'ERROR_CATEGORIES': json.dumps(state_data.get('error_categories', {})),
+                    'TIMESTAMP': state_data.get('timestamp')
+                }
+                
+                # Convert arrays and objects to VARIANT type using TO_VARIANT
+                # Insert new state using direct value insertion
+                insert_query = f"""
+                INSERT OVERWRITE INTO {state_table} (
+                    PENDING_URLS,
+                    PAGES_PROCESSED,
+                    NEW_URLS_FOUND,
+                    ERROR_CATEGORIES,
+                    TIMESTAMP
+                )
+                SELECT
+                    PARSE_JSON('{formatted_state['PENDING_URLS']}'),
+                    {formatted_state['PAGES_PROCESSED']},
+                    {formatted_state['NEW_URLS_FOUND']},
+                    PARSE_JSON('{formatted_state['ERROR_CATEGORIES']}'),
+                    '{formatted_state['TIMESTAMP']}'
+                """
+                
+                session.sql(insert_query).collect()
+                print(f"✓ Uploaded state data to {state_table}")
+
+            except Exception as e:
+                print(f"Error uploading state data: {e}")
 
         session.close()
         return True
@@ -1420,7 +1515,7 @@ class ThreadSafeCrawler:
             format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s',
             handlers=[
                 logging.FileHandler('crawler_debug.log'),
-                # logging.StreamHandler()
+                logging.StreamHandler()
             ]
         )
         self.logger = logging.getLogger(__name__)
@@ -2482,12 +2577,12 @@ def main():
 
     # Incremental Features
     ENABLE_CONTENT_CHANGE_DETECTION = True
-    REVISIT_INTERVAL_HOURS = 24 * 7  # Check for new URLs every 7 Days
+    REVISIT_INTERVAL_HOURS = 24*7  # Check for new URLs every 7 Days
     ENABLE_LANGUAGE_FILTERING = True
     ENABLE_URL_LANGUAGE_FILTERING = True
 
     # Max runtime as failsafe (Can be configured for one-time vs incremental)
-    MAX_RUNTIME_HOURS = 4
+    MAX_RUNTIME_HOURS = 0.1
 
     # File Configuration
     TABLE_PREFIX = 'CRAWLER'
@@ -2589,7 +2684,6 @@ def main():
     print("\n" + "=" * 70)
     print("🚀 ENHANCED CRAWLER CONFIGURATION SUMMARY")
     print("=" * 70)
-    print(f"📊 Storage Mode: Snowflake Database")
     print(
         f"📁 Content Storage: {'Enabled' if config['store_raw_html'] or config['store_cleaned_text'] else 'Disabled'}")
     print(f"🔍 Raw HTML Storage: {'Enabled' if config['store_raw_html'] else 'Disabled'}")
@@ -2674,7 +2768,3 @@ def main():
 
         if config['store_raw_html'] or config['store_cleaned_text']:
             print("🎉 Content storage features were enabled - check your database for rich content data!")
-
-
-if __name__ == "__main__":
-    main()
