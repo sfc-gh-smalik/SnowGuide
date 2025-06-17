@@ -2582,7 +2582,7 @@ def main():
     ENABLE_URL_LANGUAGE_FILTERING = True
 
     # Max runtime as failsafe (Can be configured for one-time vs incremental)
-    MAX_RUNTIME_HOURS = 0.1
+    MAX_RUNTIME_HOURS = 4
 
     # File Configuration
     TABLE_PREFIX = 'CRAWLER'
