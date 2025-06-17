@@ -13,15 +13,16 @@ This application consists of three major components:
 # Running the Project
 The components in this project can be run several ways
 1. Locally (for development or debugging)
-2. Snowflake Notebook (except for Slackbot) See [Running in Notebooks](.docs/notebooks.md)
-3. Snowflake SPCS Containers See [Running in SPCS](.docs/spcs.md)
+2. Snowflake Notebook (except for Slackbot) See [Running in Notebooks](./docs/notebooks.md)
+3. Snowflake SPCS Containers See [Running in SPCS](./docs/spcs.md)
 
-Note: After the first run of the Crawler you need to create the Cortex search service before running the Slackbot. This is found in [sql/cortex_search_service.sql](./sql/cortex_search_service.sql).
 
 # Common Setup
 
 ## Snowflake
 This project assumes that it will have it's own schema within Snowflake as well as several account-level objects (API integrations, warehouses, etc.) See the script in  [sql/setup.sql](./sql/setup.sql) for details. Make changes for your environment and run this script once.
+
+After the first run of the Crawler you need to create the Cortex search service before running the Slackbot. This is because the Crawler creates the tables needed for search. The script for this can be found in [sql/cortex_search_service.sql](./sql/cortex_search_service.sql).
 
 ## Environment File
 There is a sample_env file in the root of this repository. You need to update this with 
