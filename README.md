@@ -1,136 +1,38 @@
 # SnowGuide
 
-A Snowflake Docs and Knowledge Chatbot/Slackbot
+A Snowflake Docs and Knowledge Chatbot/Slackbot. This application crawls the documenation in docs.snowflake.com, extracts it, and stores it in Snowflake tables. A Chatbot service then used Snowflake Cortex search to retrieve the most relevant docs for a question and uses them to enhance the prompt send to an LLM. This is currently setup to use either OpenAI's API or the Cortex "complete" API with a model served by Snowflake.
 
-**Usage**
+This application consists of three major components:
 
-# Enhanced Incremental Web Crawler
+| Component | Description |
+| ---- | ----|
+|[Web Crawler](./docs/crawler.md) |Crawls web pages and extracts text. Can do full or incremental refresh. Document url's and hashes are then uploaded to Snowflake tables. This service should be scheduled to run periodically to pickup new or changed pages.|
+|[Web Content Loader](./docs/loader.md) |Read new or updated links created by the Crawler, extracts the text, chunks it, and loads into Snowflake tables. This service should be run after each run of the Crawler.|
+|[Slackbot Service](./docs/slackbot.md)|This is a long-running service that registers itself with Slack and is called to respond to prompts within a channel.|
 
-A multi-threaded, incremental web crawler with content storage capabilities and Snowflake integration.
+# Running the Project
+The components in this project can be run several ways
+1. Locally (for development or debugging)
+2. Snowflake Notebook (except for Slackbot) See [Running in Notebooks](.docs/notebooks.md)
+3. Snowflake SPCS Containers See [Running in SPCS](.docs/spcs.md)
 
-## Features
+Note: After the first run of the Crawler you need to create the Cortex search service before running the Slackbot. This is found in [sql/cortex_search_service.sql](./sql/cortex_search_service.sql).
 
-### Core Functionality
-- Multi-threaded crawling with configurable worker count
-- Incremental crawling with content change detection
-- URL language filtering and content language detection
-- Comprehensive content extraction and storage
-- Real-time telemetry and progress monitoring
-- Graceful shutdown handling
+# Common Setup
 
-### Storage Options
-- Snowflake database storage with optimized batch operations
-- CSV file storage with automatic upload to Snowflake
-- Content storage with configurable options
+## Snowflake
+This project assumes that it will have it's own schema within Snowflake as well as several account-level objects (API integrations, warehouses, etc.) See the script in  [sql/setup.sql](./sql/setup.sql) for details. Make changes for your environment and run this script once.
 
-### Content Processing
-- HTML content cleaning and text extraction
-- Meta tag extraction
-- Heading structure analysis
-- Link extraction and validation
-- Content change detection
-- Duplicate content detection
+## Environment File
+There is a sample_env file in the root of this repository. You need to update this with 
+your values and rename it to ".env". Currently you need to copy it to each of the sub-folders.
+```
+cp .env ./crawler
+cp .env ./loader
+cp .env ./slackbot
+```
 
-### Performance Features
-- Batch processing for database operations
-- Memory usage monitoring
-- Configurable request delays and timeouts
-- Automatic retry mechanism
-- Queue-based URL management
-
-## Configuration
-
-Key configuration options include:
-
-python 
-
-config = { 
-	# Storage configuration 
-	'use_database': True, 
-	
-	# Use Snowflake storage 
-	'table_prefix': 'CRAWLER',
-	
-	# Crawling parameters
-	'max_depth': 12,
-	'max_workers': 40,
-	'request_delay': 1,
-	
-	# Content storage options
-	'store_raw_html': False,
-	'store_cleaned_text': False,
-	'max_content_size': 5000000,  # 5MB limit
-	
-	# Incremental features
-	'enable_content_change_detection': True,
-	'revisit_interval_hours': 24 * 7,
-	
-	# Language filtering
-	'enable_language_filtering': True,
-	'enable_url_language_filtering': True
- }
-
-
-## Usage
-1.Configure the crawler settings in the `main()` function 
-2.Set up starting URLs and allowed domains 
-3.Run the crawler:
-
-python 
-if name == "main": main()
-
-## Post-Processing
-After crawling, you can process missing content using:
-
-python 
-post_process_missing_content(batch_size=100, max_retries=3)
-
-
-## Data Storage
-The crawler creates the following tables in Snowflake: 
-
-- `{prefix}_DISCOVERED_URLS`: Main table for crawled URLs and content
-- `{prefix}_VISITED_URLS`: Track visited URLs
-- `{prefix}_CONTENT_HASHES`: Track content changes
-- `{prefix}_STATE`: Store crawler state
-- `{prefix}_REVISIT_SCHEDULE`: Manage incremental crawling
-
-- ## Requirements
-- Python 3.9 + - Snowflake account with appropriate permissions
-- Required Python packages:
-- requests - beautifulsoup4 - langdetect - snowflake - snowpark - python ##
-
-
-## Best Practices
-1.Start with a small set of URLs for testing
-2.Monitor memory usage and adjust worker count accordingly
-3.Use appropriate delays to avoid overwhelming target servers
-4.Enable content storage only if needed 
-5.Configure appropriate timeouts and retry limits ## Monitoring 
-
-The crawler provides real - time telemetry including: - Pages processed per second - Memory usage - Error rates - Content change statistics - Language distribution - Queue status 
-
-## Error Handling
-- Automatic retry for recoverable errors
-- Error categorization and logging
-- Graceful shutdown on critical errors
-- Memory monitoring and protection
-
-## Limitations 
-- Only processes HTTPS URLs
-- Content size limits apply
-- Memory usage increases with worker count
-- Database performance depends on Snowflake warehouse size
-
-
-## License
-This code is provided as - is. Use at your own risk.
-
-**Contributing**
-  - Feel free to submit issues and enhancement requests.
-
-
-# .env File
+The following describes the variables set in the environment file.
 
 | Variable | Required| Description|
 | -------- | ------- | ------- |
@@ -151,3 +53,11 @@ This code is provided as - is. Use at your own risk.
 |SLACK_USER_TOKEN|YES||
 |LLM_API||cortex &#124; openai|
 |OPENAI_API_KEY||Only required when LLM_API=openai|
+
+## License
+This code is provided as - is. Use at your own risk.
+
+**Contributing**
+
+Feel free to submit issues and enhancement requests.
+
