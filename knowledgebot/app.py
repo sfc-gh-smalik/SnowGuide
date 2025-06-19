@@ -482,7 +482,6 @@ class SlackChatBot:
                 say("Error ending session. Please try again.")
                 print(f"Error ending session: {e}")
 
-
     def format_and_chunk_response(self, response, max_length=3000):
         circle_numbers = ['①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨', '⑩']
 
@@ -548,7 +547,7 @@ class SlackChatBot:
         formatted_text = re.sub(r'`(.*?)`', r'`\1`', formatted_text)
 
         # Convert markdown headings (#, ##, ### etc.) to bold text for Slack
-        formatted_text = re.sub(r'^\s*#+\s*(.*)', r'*\1*', formatted_text, flags=re.MULTILINE)
+        formatted_text = re.sub(r'^\s*#+\s*(.*)', r'\n*\1*\n', formatted_text, flags=re.MULTILINE)
 
         blocks = []
         current_block = ""
