@@ -4,9 +4,10 @@
 use role useradmin;
 create role if not exists snowguide_role;
 grant role snowguide_role to role sysadmin;
-grant role snowguide_role to user jbarnett;
 use role accountadmin;
 GRANT BIND SERVICE ENDPOINT on account to role snowguide_role;
+GRANT IMPORTED PRIVILEGES on database SNOWFLAKE_DOCUMENTATION to role snowguide_role;
+GRANT USAGE ON CORTEX SEARCH SERVICE SNOWFLAKE_DOCUMENTATION.SHARED.CKE_SNOWFLAKE_DOCS_SERVICE to role snowguide_role;
 
 --------------------------------------------------------------------------------
 -- Database and schema, warehouse, compute pool

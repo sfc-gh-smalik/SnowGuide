@@ -2,37 +2,26 @@
 
 A Snowflake Docs and Knowledge Chatbot/Slackbot. This application crawls the documenation in docs.snowflake.com, extracts it, and stores it in Snowflake tables. A Chatbot service then used Snowflake Cortex search to retrieve the most relevant docs for a question and uses them to enhance the prompt send to an LLM. This is currently setup to use either OpenAI's API or the Cortex "complete" API with a model served by Snowflake.
 
-This application consists of three major components:
+# SnowGuide
 
-| Component | Description |
-| ---- | ----|
-|[Web Crawler](./docs/crawler.md) |Crawls web pages and extracts text. Can do full or incremental refresh. Document url's and hashes are then uploaded to Snowflake tables. This service should be scheduled to run periodically to pickup new or changed pages.|
-|[Web Content Loader](./docs/loader.md) |Read new or updated links created by the Crawler, extracts the text, chunks it, and loads into Snowflake tables. This service should be run after each run of the Crawler.|
-|[Slackbot Service](./docs/slackbot.md)|This is a long-running service that registers itself with Slack and is called to respond to prompts within a channel.|
+A Snowflake Docs and Knowledge Slackbot
 
-# Running the Project
-The components in this project can be run several ways
-1. Locally (for development or debugging)
-2. Snowflake Notebook (except for Slackbot) See [Running in Notebooks](./docs/notebooks.md)
-3. Snowflake SPCS Containers See [Running in SPCS](./docs/spcs.md)
-
+**Usage**
+This is configured to run in a Snowflake SPCS container and connect directly to slack.
 
 # Common Setup
 
 ## Snowflake
-This project assumes that it will have it's own schema within Snowflake as well as several account-level objects (API integrations, warehouses, etc.) See the script in  [sql/setup.sql](./sql/setup.sql) for details. Make changes for your environment and run this script once.
-
-After the first run of the Crawler you need to create the Cortex search service before running the Slackbot. This is because the Crawler creates the tables needed for search. The script for this can be found in [sql/cortex_search_service.sql](./sql/cortex_search_service.sql).
+This project assumes that it will have it's own schema within Snowflake as well as several account-level objects (API integrations, warehouses, etc.) See the script in  [..sql/setup.sql](../sql/setup.sql) for details. Make changes for your environment and run this script once.
 
 ## Environment File
 There is a sample_env file in the root of this repository. You need to update this with 
 your values and rename it to ".env". Currently you need to copy it to each of the sub-folders.
 ```
-cp .env ./crawler
-cp .env ./loader
 cp .env ./slackbot
 ```
 
+## Environment file (Do Before Build and Deploy)
 The following describes the variables set in the environment file.
 
 | Variable | Required| Description|
@@ -41,19 +30,68 @@ The following describes the variables set in the environment file.
 |SNOWFLAKE_DATABASE|YES||
 |SNOWFLAKE_SCHEMA|YES||
 |SNOWFLAKE_WAREHOUSE|YES||
-|SNOWFLAKE_USER|YES||
+|SNOWFLAKE_USER||Only required to run locally.|
 |SNOWFLAKE_USER_ROLE|YES||
 |SNOWFLAKE_ACCOUNT|YES|\<ORG-ACCOUNT>|
 |HOST||\<ORG-ACCOUNT>.snowflakecomputing.com|
-|SNOWFLAKE_PASSWORD||If required then use a Programmatic Access Token|
+|SNOWFLAKE_PASSWORD||Only required to run locally. If required then use a Programmatic Access Token|
 ||
 |**SLACK BOT SPECIFIC**|
 |SLACK_BOT_TOKEN|YES||
-|SLACK_SIGNING_SECRET|YES||
 |SLACK_APP_TOKEN|YES||
 |SLACK_USER_TOKEN|YES||
+||
+|**Cortex search and LLM**|
 |LLM_API||cortex &#124; openai|
-|OPENAI_API_KEY||Only required when LLM_API=openai|
+|OPENAI_API_KEY||(Optional. Required if LLM_API=openai)|
+|LLM_API||cortex or openai|
+|CORTEX_SEARCH_DATABASE||'SNOWFLAKE_DOCUMENTATION'|
+|CORTEX_SEARCH_SCHEMA||'CKE_SNOWFLAKE_DOCS_SERVICE'|
+|CORTEX_SEARCH_SERVICE||'CKE_SNOWFLAKE_DOCS_SERVICE'|
+|CORTEX_SEARCH_COLUMN||'chunk'|
+|CORTEX_URL_COLUMN||'source_url'|
+
+
+# SnowGuide Setup
+## Build and Deploy
+To build and deploy this service run [build.sh](build.sh). You will need to make a few changes first such as the account name for the image repository. To get this repo url run the following in Snowflake
+
+1. Get the repo url by running the following in Snowflake:
+```
+SHOW IMAGE REPOSITORIES in schema snowguide.snowguide --> SELECT "repository_url" FROM $1;
+```
+
+2. Create a connection entry in ~/.snowsql/config
+
+3. Edit the build.sh and replace the repository name and the connection name
+
+4. Manually authenticate to the repository by running the following:
+You will also need to authenticate manually to that repo using
+```
+docker login <repo url>
+```
+5. Run the build script, which will deploy to the Snowflake image repository, build the service, and start it.
+```
+./build.sh
+```
+6. Check the status of the service using the following sql:
+```
+SHOW SERVICE CONTAINERS IN SERVICE snowguide_service;
+```
+
+7. You can view the logs from the running container using the following sql;
+```
+-- This query will print logs from the container
+SELECT value AS log_line
+  FROM TABLE(
+   SPLIT_TO_TABLE(SYSTEM$GET_SERVICE_LOGS('snowguide_service', '0', 'main'), '\n')
+  )
+  WHERE TRIM(value) <> ''
+  --order by index;
+  ORDER BY index desc limit 300;
+```
+
+This process builds an image file with our application and uploads it to an image repository in snowflake. It then will create or alter the service that uses this. It uses snowsql and assumes that the target connection is your DEFAULT!
 
 ## License
 This code is provided as - is. Use at your own risk.
