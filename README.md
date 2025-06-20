@@ -51,6 +51,8 @@ The following describes the variables set in the environment file.
 |CORTEX_SEARCH_COLUMN||'chunk'|
 |CORTEX_URL_COLUMN||'source_url'|
 
+# Slack App setup
+You will need to create a Slack application before deploying this solution. There are several key or token values that will be needed. ["docs/Setting up Slack App.docx"](Setting up Slack App) for details.
 
 # SnowGuide Setup
 ## Build and Deploy
@@ -61,7 +63,7 @@ To build and deploy this service run [build.sh](build.sh). You will need to make
 SHOW IMAGE REPOSITORIES in schema snowguide.snowguide --> SELECT "repository_url" FROM $1;
 ```
 
-2. Create a connection entry in ~/.snowsql/config
+2. Create a connection entry in ~/.snowsql/config. [https://docs.snowflake.com/en/developer-guide/snowflake-cli/connecting/configure-connections#add-a-connection](docs).
 
 3. Edit the build.sh and replace the repository name and the connection name
 

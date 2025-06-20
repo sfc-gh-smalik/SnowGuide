@@ -4,4 +4,4 @@ export SERVICE="snowguide"
 docker build --rm --platform linux/amd64 -t ${REPO}/${SERVICE} . && \
 docker push ${REPO}/${SERVICE}:latest
 
-snowsql -f ../sql/create_slackbot_service.sql
+snowsql -c <connection name> -f ../sql/create_slackbot_service.sql
