@@ -3,7 +3,8 @@
 ------------------------------------------------------------------------------------------------
 use role snowguide_role;
 use warehouse snowguide_wh;
-use schema snowguide.snowguide;
+use database snowguide;
+use schema snowguide;
 
 CREATE SERVICE IF NOT EXISTS snowguide_service
 IN COMPUTE POOL SNOWGUIDE_COMPUTE_POOL
@@ -29,7 +30,7 @@ ALTER SERVICE snowguide_service
     spec:
       containers:
       - name: main
-        image: /openai/snowguide/snowguide_repository/snowguide:latest
+        image: /snowguide/snowguide/snowguide_repository/snowguide:latest
         env:
           SERVER_PORT: 8000
       endpoints:
@@ -60,11 +61,11 @@ SHOW ENDPOINTS IN SERVICE snowguide_service ->> SELECT 'ENDPOINTS' as descriptio
 SHOW SERVICE CONTAINERS IN SERVICE snowguide_service ->> SELECT 'CONTAINERS' as description, * FROM $1;
 
 -- This query will print logs from the container
-/* 
-SELECT index, value AS log_line
+
+SELECT value AS log_line
   FROM TABLE(
    SPLIT_TO_TABLE(SYSTEM$GET_SERVICE_LOGS('snowguide_service', '0', 'main'), '\n')
   )
   WHERE TRIM(value) <> ''
+  --order by index;
   ORDER BY index desc limit 300;
-*/

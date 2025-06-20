@@ -1,4 +1,6 @@
 # Sample .env file
+
+# Snowflake Config
 SNOWFLAKE_DATABASE='{{database}}'
 SNOWFLAKE_SCHEMA='{{schema}}'
 SNOWFLAKE_WAREHOUSE='{{warehouse name}}'
@@ -8,9 +10,18 @@ SNOWFLAKE_ACCOUNT='{{organization}}={{account}}'
 HOST='{{organization}}={{account}}.snowflakecomputing.com'
 SNOWFLAKE_HOST=${HOST}
 SNOWFLAKE_PASSWORD='(optional. use PAT if needed)'
+
+# Slack Setting
 SLACK_BOT_TOKEN='{{slackbot_token}}'
 SLACK_SIGNING_SECRET='{{slackbot_secret}}'
 SLACK_APP_TOKEN='{{slackbot_app_token}}'
 SLACK_USER_TOKEN='{{slackbot_user_token}}'
+
+# Cortex search and LLM
 OPENAI_API_KEY='(Optional. Required if LLM_API=openai)'
-LLM_API=openai  # or cortex
+LLM_API=cortex  # cortex|openai
+CORTEX_SEARCH_DATABASE='SNOWFLAKE_DOCUMENTATION'
+CORTEX_SEARCH_SCHEMA='CKE_SNOWFLAKE_DOCS_SERVICE'
+CORTEX_SEARCH_SERVICE='CKE_SNOWFLAKE_DOCS_SERVICE'
+CORTEX_SEARCH_COLUMN='chunk'
+CORTEX_URL_COLUMN='source_url'
