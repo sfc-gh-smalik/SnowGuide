@@ -1,6 +1,6 @@
 # SnowGuide
 
-A Snowflake Docs and Knowledge Chatbot/Slackbot. This application uses Snowflake documenation (docs.snowflake.com) via Cortex Knowledge Extensions. A Chatbot service then uses Snowflake Cortex search to retrieve the most relevant docs for a question and uses them to enhance the prompt send to an LLM. This is currently setup to use either OpenAI's API or the Cortex "complete" API with a model served by Snowflake.
+A Snowflake Docs and Knowledge Chatbot/Slackbot. This application uses Snowflake documenation (docs.snowflake.com) via Cortex Knowledge Extensions. Setup Instructions for Share - [https://app.snowflake.com/marketplace/listing/GZSTZ67BY9OQ4/snowflake-snowflake-documentation]. A Chatbot service then uses Snowflake Cortex search to retrieve the most relevant docs for a question and uses them to enhance the prompt send to an LLM. This is currently setup to use either OpenAI's API or the Cortex "complete" API with a model served by Snowflake.
 
 # SnowGuide
 
